@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ==========================================
-복지시설 투약 관리 (단일 비밀번호 게이트 + 삭제 기능 + 전체 선택/유지) — app.py
+복지시설 투약 관리 (모바일 대응 탭 UI) — app.py
 ==========================================
 
 [설정 가이드 - .streamlit/secrets.toml]
@@ -40,17 +40,34 @@ import streamlit as st
 # 기본 설정
 # -------------------------------
 st.set_page_config(page_title="복지시설 투약 관리", layout="wide")
-st.title("💊 생활인 투약 관리 시스템 (비밀번호 게이트 포함 / 무료 배포용)")
+st.title("💊 생활인 투약 관리 시스템")
 
-# (선택) 비밀번호 입력칸 추가 스타일: 너무 넓어 보일 때 최대 폭 제한
-st.markdown("""
+# (선택) 입력 필드 최대 폭 조정: 모바일에서도 과도한 넓이를 방지
+st.markdown(
+    """
 <style>
-/* password input 필드 최대 폭(픽셀) - 필요 없으면 이 블록을 지워도 됩니다 */
+/* password input 최대 폭 */
 section[data-testid="stTextInput"] input[type="password"] {
-  max-width: 480px;  /* 360~480px 정도가 깔끔합니다 */
+  max-width: 480px;
+}
+
+/* 일반 텍스트 입력/숫자 입력의 최대 폭도 적절히 제한 */
+section[data-testid="stTextInput"] input[type="text"],
+section[data-testid="stNumberInput"] input[type="number"],
+section[data-testid="stDateInput"] input[type="text"],
+textarea {
+  max-width: 520px;
+}
+
+/* 탭이 모바일에서 붙지 않도록 여백 */
+div[data-baseweb="tab-list"] {
+  flex-wrap: wrap;
+  gap: 6px;
 }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 DB_FILE = "medication_data.csv"
 
@@ -73,11 +90,17 @@ def verify_password(plain: str, stored: str) -> bool:
     except Exception:
         return False
 
+
 def make_hash(plain: str, iterations: int = 260_000) -> str:
     """PBKDF2 해시 생성기 (관리자 도구 용)"""
     salt = os.urandom(16)
     dk = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt, iterations)
-    return f"pbkdf2_sha256${iterations}${base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
+    return (
+        f"pbkdf2_sha256${iterations}$"
+        f"{base64.b64encode(salt).decode()}$"
+        f"{base64.b64encode(dk).decode()}"
+    )
+
 
 # --- secrets 안전 로딩 ---
 def _load_app_cfg():
@@ -86,6 +109,7 @@ def _load_app_cfg():
         return dict(_s.get("app", {}))  # 섹션 없으면 {}
     except Exception:
         return {}
+
 
 APP_CFG = _load_app_cfg()
 PASSWORD_HASH = (APP_CFG.get("password_hash") or "").strip()
@@ -127,6 +151,7 @@ def render_admin_tools():
             else:
                 st.warning("평문 비밀번호를 입력해 주세요.")
 
+
 # --- 로그인 폼 (중앙 정렬 + 가로폭 1/3 + Enter 제출) ---
 def login_form(now_ts: float, align: str = "center", width_fraction: float = 1/3):
     """
@@ -160,17 +185,7 @@ def login_form(now_ts: float, align: str = "center", width_fraction: float = 1/3
             if not PASSWORD_HASH:
                 st.error("서버 비밀번호가 아직 설정되지 않았습니다. 관리자에게 문의하세요.")
                 return
-            try:
-                algo, iters, salt_b64, dk_b64 = PASSWORD_HASH.split("$")
-                assert algo == "pbkdf2_sha256"
-                iters = int(iters)
-                salt = base64.b64decode(salt_b64)
-                dk_true = base64.b64decode(dk_b64)
-                dk_test = hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt, iters)
-                ok = hmac.compare_digest(dk_true, dk_test)
-            except Exception:
-                ok = False
-
+            ok = verify_password(pwd, PASSWORD_HASH)
             if ok:
                 st.session_state.auth_ok = True
                 st.session_state.fail_count = 0
@@ -184,6 +199,7 @@ def login_form(now_ts: float, align: str = "center", width_fraction: float = 1/3
                 else:
                     remain = MAX_ATTEMPTS - st.session_state.fail_count
                     st.error(f"비밀번호가 올바르지 않습니다. (남은 시도: {remain})")
+
 
 # --- 게이트: '잠금' 또는 '미인증'일 때만 폼/도구 노출 ---
 def render_gate_and_stop_if_not_authenticated():
@@ -203,10 +219,13 @@ def render_gate_and_stop_if_not_authenticated():
         if not st.session_state.auth_ok:
             st.stop()
 
+
 # 실제 호출 (여기서 인증 통과 못하면 이후 UI 중단)
 render_gate_and_stop_if_not_authenticated()
 
-# 상단 보조 UI (로그아웃/안내)
+# -------------------------------
+# 사이드바: 로그아웃/안내 (모바일에서 핵심 UI는 메인 탭으로 이동)
+# -------------------------------
 with st.sidebar:
     if st.button("로그아웃"):
         st.session_state.auth_ok = False
@@ -214,16 +233,17 @@ with st.sidebar:
         st.session_state.locked_until = 0.0
         st.rerun()
     st.caption("보안을 위해 비밀번호는 주기적으로 교체하세요.")
+    st.caption("※ 모바일에서는 핵심 기능(등록/검색/삭제)이 상단 탭에 표시됩니다.")
 
 # -------------------------------
-# (B) 투약 관리 본 기능 (삭제 기능 포함)
+# (B) 투약 관리 본 기능
 # -------------------------------
-
 def generate_id() -> str:
     """레코드 고유 ID"""
     return uuid.uuid4().hex
 
-# 복용시간대 옵션
+
+# 복용시간대 옵션 및 정렬 기준
 TIME_OPTIONS = [
     "아침약", "점심약", "저녁약", "아침 식전약", "저녁 식전약", "취침전약"
 ]
@@ -236,12 +256,13 @@ TIME_ORDER_MAP = {
     "취침전약": 5,
 }
 
-# '기록ID' 추가: 삭제/수정 식별자
+# 필수 컬럼
 REQUIRED_COLS = [
-    "기록ID",  # 고유 식별자
+    "기록ID",
     "이름", "병원명", "약품명", "처방일", "복용일수",
     "종료예정일", "비고", "남은약", "복용시간대"
 ]
+
 
 def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -279,6 +300,7 @@ def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
     df = df[REQUIRED_COLS]
     return df
 
+
 def load_data() -> pd.DataFrame:
     if os.path.exists(DB_FILE):
         try:
@@ -291,6 +313,7 @@ def load_data() -> pd.DataFrame:
     else:
         return ensure_schema(pd.DataFrame(columns=REQUIRED_COLS))
 
+
 def save_data(df: pd.DataFrame):
     try:
         df_to_save = ensure_schema(df.copy())
@@ -298,40 +321,57 @@ def save_data(df: pd.DataFrame):
     except Exception as e:
         st.error(f"데이터 저장 중 오류 발생: {e}")
 
+
+# -------------------------------
 # 세션 상태 초기화
+# -------------------------------
 if "data" not in st.session_state:
     st.session_state.data = load_data()
 if "last_status" not in st.session_state:
     st.session_state.last_status = ""
+# 검색 상태
 if "search_text" not in st.session_state:
     st.session_state.search_text = ""
 if "search_select" not in st.session_state:
     st.session_state.search_select = ""
+if "search_active" not in st.session_state:
+    st.session_state.search_active = False  # '검색 적용'을 눌러야 필터 반영
+# 삭제 관련 상태
 if "undo_stack" not in st.session_state:
-    st.session_state.undo_stack = []  # 삭제 전 백업용 (DataFrame deep copy)
-# ✅ 선택 상태를 세션에 유지 (중요!)
+    st.session_state.undo_stack = []  # 삭제 전 백업용 (DataFrame copy)
 if "delete_selected_ids" not in st.session_state:
     st.session_state.delete_selected_ids = []  # ['기록ID', ...]
 
-# 사이드바: 신규 등록 + 검색
-with st.sidebar:
-    st.header("신규 투약 등록/업데이트")
-    with st.form("register_form", clear_on_submit=True):
-        input_name = st.text_input("생활인 성명", value="")
-        input_hospital = st.text_input("병원/진료과", value="")
-        input_med_name = st.text_input("약품명", value="")
-        input_time_slot = st.selectbox("복용 시간대", options=TIME_OPTIONS, index=0)
-        input_start_date = st.date_input("처방일", value=date.today())
-        input_days = st.number_input("복용 일수", min_value=1, value=30)
-        input_memo = st.text_area("비고/특이사항", value="")
-        input_left_amount = st.number_input("남은 약 수량", min_value=0, value=0)
-        submitted = st.form_submit_button("등록하기")
+# -------------------------------
+# 상단 탭 UI (모바일 대응)
+# -------------------------------
+tab_reg, tab_dash, tab_del = st.tabs(["📝 등록/검색", "📊 대시보드", "🗑️ 삭제"])
+
+# -------------------------------------------------------------------
+# 탭 1: 등록/검색 (사이드바에서 메인 탭으로 이동 — 모바일에서도 항상 보임)
+# -------------------------------------------------------------------
+with tab_reg:
+    st.subheader("신규 투약 등록")
+    with st.form("register_form_main", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            input_name = st.text_input("생활인 성명", value="")
+            input_med_name = st.text_input("약품명", value="")
+            input_time_slot = st.selectbox("복용 시간대", options=TIME_OPTIONS, index=0)
+            input_left_amount = st.number_input("남은 약 수량", min_value=0, value=0)
+        with col2:
+            input_hospital = st.text_input("병원/진료과", value="")
+            input_start_date = st.date_input("처방일", value=date.today())
+            input_days = st.number_input("복용 일수", min_value=1, value=30)
+            input_memo = st.text_area("비고/특이사항", value="")
+
+        submitted = st.form_submit_button("등록하기", use_container_width=True)
 
     if submitted:
-        name = input_name.strip()
-        hospital = input_hospital.strip()
-        med_name = input_med_name.strip()
-        time_slot = input_time_slot.strip() if input_time_slot else ""
+        name = (input_name or "").strip()
+        hospital = (input_hospital or "").strip()
+        med_name = (input_med_name or "").strip()
+        time_slot = (input_time_slot or "").strip()
 
         if not (name and hospital and med_name and time_slot):
             st.warning("모든 필수 정보를 입력해 주세요. (성명/병원/약품명/복용 시간대)")
@@ -347,7 +387,7 @@ with st.sidebar:
                 "처방일": start_ts,
                 "복용일수": int(input_days),
                 "종료예정일": end_ts,
-                "비고": input_memo.strip(),
+                "비고": (input_memo or "").strip(),
                 "남은약": int(input_left_amount),
             }])
             st.session_state.data = ensure_schema(pd.concat([st.session_state.data, new_row], ignore_index=True))
@@ -356,33 +396,45 @@ with st.sidebar:
             st.success(st.session_state.last_status)
 
     st.markdown("---")
-    st.header("대상자 검색")
+    st.subheader("대상자 검색")
+
     names_list = sorted([n for n in st.session_state.data["이름"].dropna().unique() if n != ""])
 
-    st.session_state.search_text = st.text_input(
-        "이름(부분검색 가능)", value=st.session_state.search_text, placeholder="예: 홍길동"
-    )
-    st.session_state.search_select = st.selectbox(
-        "이름(목록에서 선택)",
-        options=[""] + names_list,
-        index=([""] + names_list).index(st.session_state.search_select) if st.session_state.search_select in ([""] + names_list) else 0
-    )
+    # 라이브 입력은 유지하되, '검색 적용'을 눌러야 활성화되도록 구성
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state.search_text = st.text_input(
+            "이름(부분검색 가능)", value=st.session_state.search_text, placeholder="예: 홍길동", key="search_text_main"
+        )
+    with c2:
+        st.session_state.search_select = st.selectbox(
+            "이름(목록에서 선택)",
+            options=[""] + names_list,
+            index=([""] + names_list).index(st.session_state.search_select)
+            if st.session_state.search_select in ([""] + names_list)
+            else 0,
+            key="search_select_main",
+        )
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        apply_search = st.button("검색 적용")
-    with col_b:
-        clear_search = st.button("검색 해제(전체 보기)")
+    bc1, bc2, bc3 = st.columns([1, 1, 2])
+    with bc1:
+        if st.button("검색 적용", use_container_width=True, key="btn_apply_search"):
+            st.session_state.search_active = True
+            st.experimental_rerun()
+    with bc2:
+        if st.button("검색 해제(전체 보기)", use_container_width=True, key="btn_clear_search"):
+            st.session_state.search_text = ""
+            st.session_state.search_select = ""
+            st.session_state.search_active = False
+            # 검색 해제 시 선택 상태 초기화(선택사항)
+            st.session_state.delete_selected_ids = []
+            st.experimental_rerun()
+    with bc3:
+        st.caption("※ '검색 적용'을 눌러야 필터가 반영됩니다.")
 
-    if clear_search:
-        st.session_state.search_text = ""
-        st.session_state.search_select = ""
-        # 검색 해제 시 선택 상태도 초기화(선택사항)
-        st.session_state.delete_selected_ids = []
-
-# 메인 대시보드
-st.subheader("대상자 투약 현황 대시보드")
-
+# -------------------------------
+# 공통: 필터링 로직 (모든 탭에서 동일하게 사용)
+# -------------------------------
 df_display = ensure_schema(st.session_state.data.copy())
 
 if not df_display.empty:
@@ -391,197 +443,214 @@ if not df_display.empty:
 
 filtered_df = df_display.copy()
 
-selected_name = st.session_state.search_select.strip() if st.session_state.search_select else ""
-typed_query = st.session_state.search_text.strip()
+selected_name = (st.session_state.search_select or "").strip()
+typed_query = (st.session_state.search_text or "").strip()
 
-if apply_search or selected_name or typed_query:
+if st.session_state.search_active and (selected_name or typed_query):
     if selected_name:
         filtered_df = filtered_df[filtered_df["이름"] == selected_name]
     elif typed_query:
         mask = filtered_df["이름"].str.contains(typed_query, case=False, na=False)
         filtered_df = filtered_df[mask]
 
-# 개인 요약(단일 대상자일 때)
-unique_names = filtered_df["이름"].dropna().unique().tolist() if not filtered_df.empty else []
-if len(unique_names) == 1:
-    person = unique_names[0]
-    st.markdown(f"### 👤 '{person}' 개인 요약")
-    person_df = filtered_df.copy()
-    person_df["처방일(표시)"] = person_df["처방일"].dt.strftime("%Y-%m-%d")
-    person_df["종료예정일(표시)"] = person_df["종료예정일"].dt.strftime("%Y-%m-%d")
-    person_df["시간순서"] = person_df["복용시간대"].map(TIME_ORDER_MAP).fillna(999).astype(int)
-
-    hospitals = person_df["병원명"].dropna().unique().tolist()
-    hospitals = sorted([h for h in hospitals if h != ""])
-
-    if hospitals:
-        for h in hospitals:
-            sub = person_df[person_df["병원명"] == h].copy()
-            sub = sub.sort_values(["종료예정일", "시간순서", "약품명"], kind="mergesort")
-            show_cols = ["병원명", "약품명", "복용시간대", "처방일(표시)", "종료예정일(표시)", "남은일수", "비고", "남은약"]
-            with st.expander(f"🏥 병원: {h} — 약품 {len(sub)}건", expanded=True):
-                st.dataframe(sub[show_cols].rename(columns={
-                    "처방일(표시)": "처방일",
-                    "종료예정일(표시)": "종료예정일"
-                }), use_container_width=True)
-    else:
-        st.info("해당 대상자에 대한 병원 기록이 없습니다.")
-
-# 대시보드 표(전체/필터 결과)
-total_count = len(df_display) if not df_display.empty else 0
-filtered_count = len(filtered_df) if not filtered_df.empty else 0
-st.caption(f"필터링된 결과: **{filtered_count}건** / 전체: {total_count}건")
-
+# 공통 정렬본 (삭제 탭에서도 재사용)
 if not filtered_df.empty:
     tmp = filtered_df.copy()
     tmp["시간순서"] = tmp["복용시간대"].map(TIME_ORDER_MAP).fillna(999).astype(int)
     display_cols_main = ["이름", "병원명", "약품명", "복용시간대", "처방일", "복용일수", "종료예정일", "남은일수", "비고", "남은약"]
     tmp = tmp.sort_values(["이름", "병원명", "종료예정일", "시간순서", "약품명"], kind="mergesort")
     filtered_sorted = tmp[["기록ID"] + display_cols_main].copy()
-
-    # 화면 표시용 날짜 포맷(메인 표에서는 기록ID 숨김)
-    df_show = filtered_sorted.copy()
-    df_show["처방일"] = df_show["처방일"].dt.strftime("%Y-%m-%d")
-    df_show["종료예정일"] = df_show["종료예정일"].dt.strftime("%Y-%m-%d")
-    st.dataframe(df_show[display_cols_main], use_container_width=True)
-
-    # 다운로드(현재 필터 결과 기준)
-    csv_bytes = filtered_sorted.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-    st.download_button(
-        "📥 (현재 보기 기준) 데이터를 엑셀로 내보내기",
-        csv_bytes,
-        "투약관리데이터_필터결과.csv",
-        "text/csv",
-        key="download-csv"
-    )
 else:
-    st.info("표시할 데이터가 없습니다. (검색 조건을 확인해 주세요)")
+    filtered_sorted = pd.DataFrame(columns=["기록ID", "이름", "병원명", "약품명", "복용시간대", "처방일", "복용일수", "종료예정일", "남은일수", "비고", "남은약"])
 
-# -------------------------------
-# 🗑️ 삭제 도구 (현재 필터 결과 기준) — 전체 선택/해제 + 선택 유지
-# -------------------------------
-st.markdown("## 🗑️ 삭제 도구")
 
-if filtered_df.empty:
-    st.info("삭제할 대상이 없습니다. (검색 조건을 확인해 주세요)")
-else:
-    # 삭제 에디터용 데이터프레임: 현재 필터 결과만
-    delete_df = filtered_sorted.copy()  # ['기록ID' + 표시 컬럼]
-    delete_df = delete_df.rename(columns={
-        "처방일": "처방일(표시용)",
-        "종료예정일": "종료예정일(표시용)"
-    })
-    delete_df["처방일(표시용)"] = pd.to_datetime(delete_df["처방일(표시용)"]).dt.strftime("%Y-%m-%d")
-    delete_df["종료예정일(표시용)"] = pd.to_datetime(delete_df["종료예정일(표시용)"]).dt.strftime("%Y-%m-%d")
+# -------------------------------------------------------------------
+# 탭 2: 대시보드
+# -------------------------------------------------------------------
+with tab_dash:
+    st.subheader("대상자 투약 현황 대시보드")
 
-    # ✅ 세션에 저장된 선택 상태로 '삭제' 체크 채워넣기
-    sel_set = set(st.session_state.delete_selected_ids)
-    delete_df.insert(1, "삭제", delete_df["기록ID"].isin(sel_set))
+    # 개인 요약(단일 대상자일 때)
+    unique_names = filtered_df["이름"].dropna().unique().tolist() if not filtered_df.empty else []
+    if len(unique_names) == 1:
+        person = unique_names[0]
+        st.markdown(f"### 👤 '{person}' 개인 요약")
+        person_df = filtered_df.copy()
+        person_df["처방일(표시)"] = person_df["처방일"].dt.strftime("%Y-%m-%d")
+        person_df["종료예정일(표시)"] = person_df["종료예정일"].dt.strftime("%Y-%m-%d")
+        person_df["시간순서"] = person_df["복용시간대"].map(TIME_ORDER_MAP).fillna(999).astype(int)
 
-    # 상단 컨트롤: 전체 선택/해제 버튼 (세션에 직접 반영)
-    bc1, bc2, bc3 = st.columns([1, 1, 3])
-    with bc1:
-        if st.button("✅ 전체 선택", use_container_width=True):
-            st.session_state.delete_selected_ids = delete_df["기록ID"].tolist()
-            st.rerun()
-    with bc2:
-        if st.button("↩️ 전체 해제", use_container_width=True):
-            st.session_state.delete_selected_ids = []
-            st.rerun()
-    with bc3:
-        st.caption("※ '전체 선택' 후 일부만 해제도 가능합니다. 선택은 화면 갱신 후에도 유지됩니다.")
+        hospitals = person_df["병원명"].dropna().unique().tolist()
+        hospitals = sorted([h for h in hospitals if h != ""])
 
-    st.caption("아래 표에서 삭제할 행의 체크박스를 선택/해제한 뒤, '선택 행 삭제' 버튼을 누르세요.")
-    edited = st.data_editor(
-        delete_df,
-        column_config={
-            "삭제": st.column_config.CheckboxColumn(
-                "삭제", help="삭제할 행에 체크", default=False
-            ),
-            "기록ID": st.column_config.TextColumn("기록ID", help="내부 식별자(읽기전용)"),
-            "처방일(표시용)": st.column_config.DateColumn("처방일", format="YYYY-MM-DD", disabled=True),
-            "종료예정일(표시용)": st.column_config.DateColumn("종료예정일", format="YYYY-MM-DD", disabled=True),
-        },
-        disabled=["기록ID", "이름", "병원명", "약품명", "복용시간대", "처방일(표시용)", "종료예정일(표시용)", "복용일수", "남은일수", "비고", "남은약"],
-        use_container_width=True,
-        key="delete_editor",
-        hide_index=True
-    )
-
-    # ✅ 사용자가 체크/해제한 최신 상태를 세션에 반영 (rerun 되어도 유지)
-    try:
-        selected_now = edited.loc[edited["삭제"] == True, "기록ID"].tolist()
-    except Exception:
-        selected_now = []
-    st.session_state.delete_selected_ids = selected_now
-
-    # 선택 카운트 표시
-    st.caption(f"현재 선택: {len(selected_now)}건 / 표시 중: {len(edited)}건")
-
-    # 삭제 실행 UI
-    col_d1, col_d2 = st.columns([1.2, 1])
-    with col_d1:
-        confirm = st.checkbox("정말 삭제하시겠습니까?", value=False)
-    with col_d2:
-        run_delete = st.button("🚨 선택 행 삭제", type="primary", use_container_width=True)
-
-    # 복원(Undo)
-    col_u1, col_u2 = st.columns([1, 1])
-    with col_u1:
-        can_undo = len(st.session_state.undo_stack) > 0
-        if st.button("↩️ 마지막 삭제 복원", disabled=not can_undo, use_container_width=True):
-            # 가장 최근 백업 복원
-            st.session_state.data = ensure_schema(st.session_state.undo_stack.pop())
-            save_data(st.session_state.data)
-            st.success("마지막 삭제 작업을 복원했습니다.")
-            st.rerun()
-    with col_u2:
-        st.caption("※ 복원은 같은 실행 세션 내에서만 가능")
-
-    # 실제 삭제 처리
-    if run_delete:
-        selected_ids = list(st.session_state.delete_selected_ids)
-        if not selected_ids:
-            st.warning("삭제할 행을 선택해 주세요.")
-        elif not confirm:
-            st.warning("체크박스로 삭제 의사를 확인해 주세요.")
+        if hospitals:
+            for h in hospitals:
+                sub = person_df[person_df["병원명"] == h].copy()
+                sub = sub.sort_values(["종료예정일", "시간순서", "약품명"], kind="mergesort")
+                show_cols = ["병원명", "약품명", "복용시간대", "처방일(표시)", "종료예정일(표시)", "남은일수", "비고", "남은약"]
+                with st.expander(f"🏥 병원: {h} — 약품 {len(sub)}건", expanded=True):
+                    st.dataframe(sub[show_cols].rename(columns={
+                        "처방일(표시)": "처방일",
+                        "종료예정일(표시)": "종료예정일"
+                    }), use_container_width=True)
         else:
-            # 백업 스택에 현재 데이터 저장(복원용)
-            st.session_state.undo_stack.append(st.session_state.data.copy())
+            st.info("해당 대상자에 대한 병원 기록이 없습니다.")
 
-            before = len(st.session_state.data)
-            st.session_state.data = st.session_state.data[~st.session_state.data["기록ID"].isin(selected_ids)].copy()
-            after = len(st.session_state.data)
-            removed = before - after
+    # 대시보드 표(전체/필터 결과)
+    total_count = len(df_display) if not df_display.empty else 0
+    filtered_count = len(filtered_df) if not filtered_df.empty else 0
+    st.caption(f"필터링된 결과: **{filtered_count}건** / 전체: {total_count}건")
 
-            save_data(st.session_state.data)
-            # 삭제 후 선택 목록 초기화
-            st.session_state.delete_selected_ids = []
-            st.success(f"선택한 {removed}건을 삭제했습니다.")
-            st.rerun()
+    if not filtered_df.empty:
+        # 화면 표시용 날짜 포맷(메인 표에서는 기록ID 숨김)
+        df_show = filtered_sorted.copy()
+        df_show["처방일"] = df_show["처방일"].dt.strftime("%Y-%m-%d")
+        df_show["종료예정일"] = df_show["종료예정일"].dt.strftime("%Y-%m-%d")
+        st.dataframe(df_show[["이름", "병원명", "약품명", "복용시간대", "처방일", "복용일수", "종료예정일", "남은일수", "비고", "남은약"]],
+                     use_container_width=True)
 
-# (옵션) 단일 대상자일 때 "이 사람 기록 전체 삭제"
-if len(unique_names) == 1 and not filtered_df.empty:
-    with st.expander(f"🧹 '{unique_names[0]}' 대상자 기록 일괄 삭제 (주의)", expanded=False):
-        st.warning("이 기능은 현재 필터 결과에서 해당 대상자의 모든 기록을 삭제합니다. 신중히 사용하세요.")
-        all_confirm = st.checkbox("정말 이 대상자의 모든 기록을 삭제합니다.", value=False)
-        all_delete = st.button("🚨 이 대상자 기록 전체 삭제")
-        if all_delete:
-            if not all_confirm:
+        # 다운로드(현재 필터 결과 기준)
+        csv_bytes = filtered_sorted.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            "📥 (현재 보기 기준) 데이터를 엑셀로 내보내기",
+            csv_bytes,
+            "투약관리데이터_필터결과.csv",
+            "text/csv",
+            key="download-csv"
+        )
+    else:
+        st.info("표시할 데이터가 없습니다. (검색 조건을 확인해 주세요)")
+
+# -------------------------------------------------------------------
+# 탭 3: 삭제 (현재 필터 결과 기준) — 전체 선택/해제 + 선택 유지
+# -------------------------------------------------------------------
+with tab_del:
+    st.subheader("🗑️ 삭제 도구")
+
+    if filtered_sorted.empty:
+        st.info("삭제할 대상이 없습니다. (검색 조건을 확인해 주세요)")
+    else:
+        # 삭제 에디터용 데이터프레임: 현재 필터 결과만
+        delete_df = filtered_sorted.copy()  # ['기록ID' + 표시 컬럼]
+        delete_df = delete_df.rename(columns={
+            "처방일": "처방일(표시용)",
+            "종료예정일": "종료예정일(표시용)"
+        })
+        delete_df["처방일(표시용)"] = pd.to_datetime(delete_df["처방일(표시용)"]).dt.strftime("%Y-%m-%d")
+        delete_df["종료예정일(표시용)"] = pd.to_datetime(delete_df["종료예정일(표시용)"]).dt.strftime("%Y-%m-%d")
+
+        # ✅ 세션에 저장된 선택 상태로 '삭제' 체크 채워넣기
+        sel_set = set(st.session_state.delete_selected_ids)
+        delete_df.insert(1, "삭제", delete_df["기록ID"].isin(sel_set))
+
+        # 상단 컨트롤: 전체 선택/해제 버튼 (세션에 직접 반영)
+        bc1, bc2, bc3 = st.columns([1, 1, 3])
+        with bc1:
+            if st.button("✅ 전체 선택", use_container_width=True, key="btn_select_all"):
+                st.session_state.delete_selected_ids = delete_df["기록ID"].tolist()
+                st.experimental_rerun()
+        with bc2:
+            if st.button("↩️ 전체 해제", use_container_width=True, key="btn_clear_all"):
+                st.session_state.delete_selected_ids = []
+                st.experimental_rerun()
+        with bc3:
+            st.caption("※ '전체 선택' 후 일부만 해제도 가능합니다. 선택은 화면 갱신 후에도 유지됩니다.")
+
+        st.caption("아래 표에서 삭제할 행의 체크박스를 선택/해제한 뒤, '선택 행 삭제' 버튼을 누르세요.")
+        edited = st.data_editor(
+            delete_df,
+            column_config={
+                "삭제": st.column_config.CheckboxColumn(
+                    "삭제", help="삭제할 행에 체크", default=False
+                ),
+                "기록ID": st.column_config.TextColumn("기록ID", help="내부 식별자(읽기전용)"),
+                "처방일(표시용)": st.column_config.DateColumn("처방일", format="YYYY-MM-DD", disabled=True),
+                "종료예정일(표시용)": st.column_config.DateColumn("종료예정일", format="YYYY-MM-DD", disabled=True),
+            },
+            disabled=[
+                "기록ID", "이름", "병원명", "약품명", "복용시간대",
+                "처방일(표시용)", "종료예정일(표시용)", "복용일수", "남은일수", "비고", "남은약"
+            ],
+            use_container_width=True,
+            key="delete_editor",
+            hide_index=True
+        )
+
+        # ✅ 사용자가 체크/해제한 최신 상태를 세션에 반영 (rerun 되어도 유지)
+        try:
+            selected_now = edited.loc[edited["삭제"] == True, "기록ID"].tolist()
+        except Exception:
+            selected_now = []
+        st.session_state.delete_selected_ids = selected_now
+
+        # 선택 카운트 표시
+        st.caption(f"현재 선택: {len(selected_now)}건 / 표시 중: {len(edited)}건")
+
+        # 삭제 실행 UI
+        col_d1, col_d2 = st.columns([1.2, 1])
+        with col_d1:
+            confirm = st.checkbox("정말 삭제하시겠습니까?", value=False, key="chk_confirm_delete")
+        with col_d2:
+            run_delete = st.button("🚨 선택 행 삭제", type="primary", use_container_width=True, key="btn_run_delete")
+
+        # 복원(Undo)
+        col_u1, col_u2 = st.columns([1, 1])
+        with col_u1:
+            can_undo = len(st.session_state.undo_stack) > 0
+            if st.button("↩️ 마지막 삭제 복원", disabled=not can_undo, use_container_width=True, key="btn_undo"):
+                # 가장 최근 백업 복원
+                st.session_state.data = ensure_schema(st.session_state.undo_stack.pop())
+                save_data(st.session_state.data)
+                st.success("마지막 삭제 작업을 복원했습니다.")
+                st.experimental_rerun()
+        with col_u2:
+            st.caption("※ 복원은 같은 실행 세션 내에서만 가능")
+
+        # 실제 삭제 처리
+        if run_delete:
+            selected_ids = list(st.session_state.delete_selected_ids)
+            if not selected_ids:
+                st.warning("삭제할 행을 선택해 주세요.")
+            elif not confirm:
                 st.warning("체크박스로 삭제 의사를 확인해 주세요.")
             else:
-                # 백업
+                # 백업 스택에 현재 데이터 저장(복원용)
                 st.session_state.undo_stack.append(st.session_state.data.copy())
-                target = unique_names[0]
+
                 before = len(st.session_state.data)
-                st.session_state.data = st.session_state.data[st.session_state.data["이름"] != target].copy()
+                st.session_state.data = st.session_state.data[~st.session_state.data["기록ID"].isin(selected_ids)].copy()
                 after = len(st.session_state.data)
                 removed = before - after
+
                 save_data(st.session_state.data)
-                # 선택 목록 초기화
+                # 삭제 후 선택 목록 초기화
                 st.session_state.delete_selected_ids = []
-                st.success(f"'{target}' 대상자의 기록 {removed}건을 삭제했습니다.")
-                st.rerun()
+                st.success(f"선택한 {removed}건을 삭제했습니다.")
+                st.experimental_rerun()
+
+    # (옵션) 단일 대상자일 때 "이 사람 기록 전체 삭제"
+    unique_names = filtered_df["이름"].dropna().unique().tolist() if not filtered_df.empty else []
+    if len(unique_names) == 1 and not filtered_df.empty:
+        with st.expander(f"🧹 '{unique_names[0]}' 대상자 기록 일괄 삭제 (주의)", expanded=False):
+            st.warning("이 기능은 현재 필터 결과에서 해당 대상자의 모든 기록을 삭제합니다. 신중히 사용하세요.")
+            all_confirm = st.checkbox("정말 이 대상자의 모든 기록을 삭제합니다.", value=False, key="chk_all_delete")
+            all_delete = st.button("🚨 이 대상자 기록 전체 삭제", key="btn_all_delete")
+            if all_delete:
+                if not all_confirm:
+                    st.warning("체크박스로 삭제 의사를 확인해 주세요.")
+                else:
+                    # 백업
+                    st.session_state.undo_stack.append(st.session_state.data.copy())
+                    target = unique_names[0]
+                    before = len(st.session_state.data)
+                    st.session_state.data = st.session_state.data[st.session_state.data["이름"] != target].copy()
+                    after = len(st.session_state.data)
+                    removed = before - after
+                    save_data(st.session_state.data)
+                    # 선택 목록 초기화
+                    st.session_state.delete_selected_ids = []
+                    st.success(f"'{target}' 대상자의 기록 {removed}건을 삭제했습니다.")
+                    st.experimental_rerun()
 
 # 마지막 상태 메시지 토스트
 if st.session_state.last_status:
