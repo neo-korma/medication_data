@@ -31,7 +31,7 @@ import base64
 import hashlib
 import hmac
 import uuid
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
 import pandas as pd
 import streamlit as st
@@ -420,7 +420,7 @@ with tab_reg:
     with bc1:
         if st.button("검색 적용", use_container_width=True, key="btn_apply_search"):
             st.session_state.search_active = True
-            st.experimental_rerun()
+            st.rerun()
     with bc2:
         if st.button("검색 해제(전체 보기)", use_container_width=True, key="btn_clear_search"):
             st.session_state.search_text = ""
@@ -428,7 +428,7 @@ with tab_reg:
             st.session_state.search_active = False
             # 검색 해제 시 선택 상태 초기화(선택사항)
             st.session_state.delete_selected_ids = []
-            st.experimental_rerun()
+            st.rerun()
     with bc3:
         st.caption("※ '검색 적용'을 눌러야 필터가 반영됩니다.")
 
@@ -506,13 +506,15 @@ with tab_dash:
         df_show = filtered_sorted.copy()
         df_show["처방일"] = df_show["처방일"].dt.strftime("%Y-%m-%d")
         df_show["종료예정일"] = df_show["종료예정일"].dt.strftime("%Y-%m-%d")
-        st.dataframe(df_show[["이름", "병원명", "약품명", "복용시간대", "처방일", "복용일수", "종료예정일", "남은일수", "비고", "남은약"]],
-                     use_container_width=True)
+        st.dataframe(
+            df_show[["이름", "병원명", "약품명", "복용시간대", "처방일", "복용일수", "종료예정일", "남은일수", "비고", "남은약"]],
+            use_container_width=True
+        )
 
-        # 다운로드(현재 필터 결과 기준)
+        # 다운로드(현재 필터 결과 기준) — CSV
         csv_bytes = filtered_sorted.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
         st.download_button(
-            "📥 (현재 보기 기준) 데이터를 엑셀로 내보내기",
+            "📥 (현재 보기 기준) 데이터를 CSV로 내보내기",
             csv_bytes,
             "투약관리데이터_필터결과.csv",
             "text/csv",
@@ -532,12 +534,13 @@ with tab_del:
     else:
         # 삭제 에디터용 데이터프레임: 현재 필터 결과만
         delete_df = filtered_sorted.copy()  # ['기록ID' + 표시 컬럼]
+        # 표시용 날짜는 'date' 타입으로 보존 (DateColumn과 잘 맞음)
         delete_df = delete_df.rename(columns={
             "처방일": "처방일(표시용)",
             "종료예정일": "종료예정일(표시용)"
         })
-        delete_df["처방일(표시용)"] = pd.to_datetime(delete_df["처방일(표시용)"]).dt.strftime("%Y-%m-%d")
-        delete_df["종료예정일(표시용)"] = pd.to_datetime(delete_df["종료예정일(표시용)"]).dt.strftime("%Y-%m-%d")
+        delete_df["처방일(표시용)"] = pd.to_datetime(delete_df["처방일(표시용)"], errors="coerce").dt.date
+        delete_df["종료예정일(표시용)"] = pd.to_datetime(delete_df["종료예정일(표시용)"], errors="coerce").dt.date
 
         # ✅ 세션에 저장된 선택 상태로 '삭제' 체크 채워넣기
         sel_set = set(st.session_state.delete_selected_ids)
@@ -548,11 +551,11 @@ with tab_del:
         with bc1:
             if st.button("✅ 전체 선택", use_container_width=True, key="btn_select_all"):
                 st.session_state.delete_selected_ids = delete_df["기록ID"].tolist()
-                st.experimental_rerun()
+                st.rerun()
         with bc2:
             if st.button("↩️ 전체 해제", use_container_width=True, key="btn_clear_all"):
                 st.session_state.delete_selected_ids = []
-                st.experimental_rerun()
+                st.rerun()
         with bc3:
             st.caption("※ '전체 선택' 후 일부만 해제도 가능합니다. 선택은 화면 갱신 후에도 유지됩니다.")
 
@@ -602,7 +605,7 @@ with tab_del:
                 st.session_state.data = ensure_schema(st.session_state.undo_stack.pop())
                 save_data(st.session_state.data)
                 st.success("마지막 삭제 작업을 복원했습니다.")
-                st.experimental_rerun()
+                st.rerun()
         with col_u2:
             st.caption("※ 복원은 같은 실행 세션 내에서만 가능")
 
@@ -626,7 +629,7 @@ with tab_del:
                 # 삭제 후 선택 목록 초기화
                 st.session_state.delete_selected_ids = []
                 st.success(f"선택한 {removed}건을 삭제했습니다.")
-                st.experimental_rerun()
+                st.rerun()
 
     # (옵션) 단일 대상자일 때 "이 사람 기록 전체 삭제"
     unique_names = filtered_df["이름"].dropna().unique().tolist() if not filtered_df.empty else []
@@ -650,7 +653,7 @@ with tab_del:
                     # 선택 목록 초기화
                     st.session_state.delete_selected_ids = []
                     st.success(f"'{target}' 대상자의 기록 {removed}건을 삭제했습니다.")
-                    st.experimental_rerun()
+                    st.rerun()
 
 # 마지막 상태 메시지 토스트
 if st.session_state.last_status:
