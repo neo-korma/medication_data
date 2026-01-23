@@ -54,8 +54,18 @@ from selenium.webdriver.support import expected_conditions as EC
 st.set_page_config(page_title="복지시설 투약 관리", layout="wide")
 st.title("💊 생활인 투약 관리 시스템 (Microsoft 365)")
 
-# 상단 탭 UI 정의 (희망이음 연동 포함)
-tab_reg, tab_dash, tab_rpa, tab_del = st.tabs(["📝 등록/검색", "📊 대시보드", "🤖 희망이음 연동", "🗑️ 삭제"])
+# --- [필수 상수 정의] 세션 초기화 등에 사용됨 ---
+REQUIRED_COLS = [
+    "기록ID", "이름", "병원명", "약품명", "처방일", "복용일수",
+    "종료예정일", "비고", "남은약", "복용시간대"
+]
+
+TIME_OPTIONS = ["아침약", "점심약", "저녁약", "아침 식전약", "저녁 식전약", "취침전약"]
+
+TIME_ORDER_MAP = {
+    "아침 식전약": 0, "아침약": 1, "점심약": 2,
+    "저녁 식전약": 3, "저녁약": 4, "취침전약": 5,
+}
 
 # (선택) 입력 필드 최대 폭 조정: 모바일에서도 과도한 넓이를 방지
 st.markdown(
@@ -131,13 +141,28 @@ PASSWORD_HASH = (APP_CFG.get("password_hash") or "").strip()
 MAX_ATTEMPTS = int(APP_CFG.get("max_attempts", 5))
 LOCK_MINUTES = int(APP_CFG.get("lock_minutes", 10))
 
-# --- 상태값 ---
+# --- 상태값 초기화 (최상단 배치) ---
 if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
 if "fail_count" not in st.session_state:
     st.session_state.fail_count = 0
 if "locked_until" not in st.session_state:
     st.session_state.locked_until = 0.0
+if "last_status" not in st.session_state:
+    st.session_state.last_status = ""
+if "search_text" not in st.session_state:
+    st.session_state.search_text = ""
+if "search_select" not in st.session_state:
+    st.session_state.search_select = ""
+if "search_active" not in st.session_state:
+    st.session_state.search_active = False
+if "undo_stack" not in st.session_state:
+    st.session_state.undo_stack = []
+if "delete_selected_ids" not in st.session_state:
+    st.session_state.delete_selected_ids = []
+if "data" not in st.session_state:
+    # 헬퍼 함수가 정의된 후에 호출하기 위해 아래로 미루거나 여기서 기본값 설정
+    st.session_state.data = pd.DataFrame(columns=REQUIRED_COLS)
 
 # --- 관리자 도구(해시 생성기): '정말 필요할 때'만 보여주기 ---
 def render_admin_tools():
@@ -221,56 +246,15 @@ def render_gate_and_stop_if_not_authenticated():
     if not st.session_state.auth_ok:
         login_form(now_ts, align="center", width_fraction=1/3)
         render_admin_tools()
-        if not st.session_state.auth_ok:
-            st.stop()
+        st.stop()
 
-
-# 실제 호출
-render_gate_and_stop_if_not_authenticated()
-
-# -------------------------------
-# 사이드바: 로그아웃/안내
-# -------------------------------
-with st.sidebar:
-    if st.button("로그아웃"):
-        st.session_state.auth_ok = False
-        st.session_state.fail_count = 0
-        st.session_state.locked_until = 0.0
-        st.rerun()
-    st.caption("보안을 위해 비밀번호는 주기적으로 교체하세요.")
-    st.caption("※ 모바일에서는 핵심 기능(등록/검색/삭제)이 상단 탭에 표시됩니다.")
-    st.write("---")
-    st.write("🛠️ **디버깅 정보**")
-    st.write("- 앱 버전: 2.1 (RPA 연동 포함)")
-    st.write(f"- 탭 개수: 4개 (정상)")
-
-# -------------------------------
+# -------------------------------------------------------------------
 # (B) 투약 관리 본 기능
-# -------------------------------
+# -------------------------------------------------------------------
 def generate_id() -> str:
     """레코드 고유 ID"""
     return uuid.uuid4().hex
 
-
-# 복용시간대 옵션 및 정렬 기준
-TIME_OPTIONS = [
-    "아침약", "점심약", "저녁약", "아침 식전약", "저녁 식전약", "취침전약"
-]
-TIME_ORDER_MAP = {
-    "아침 식전약": 0,
-    "아침약": 1,
-    "점심약": 2,
-    "저녁 식전약": 3,
-    "저녁약": 4,
-    "취침전약": 5,
-}
-
-# 필수 컬럼
-REQUIRED_COLS = [
-    "기록ID",
-    "이름", "병원명", "약품명", "처방일", "복용일수",
-    "종료예정일", "비고", "남은약", "복용시간대"
-]
 
 # =========================
 # Microsoft Graph (Lists + OneDrive) 헬퍼
@@ -569,25 +553,26 @@ def save_data(df: pd.DataFrame):
     except Exception as e:
         st.error(f"OneDrive 백업 업로드 실패: {e}")
 
-# -------------------------------
-# 세션 상태 초기화
-# -------------------------------
-if "data" not in st.session_state:
+# =========================
+# 메인 실행 흐름
+# =========================
+
+# 1. 인증 게이트
+render_gate_and_stop_if_not_authenticated()
+
+# 2. 사이드바 (로그아웃 & 버전)
+with st.sidebar:
+    if st.button("로그아웃", key="sidebar_logout"):
+        st.session_state.auth_ok = False
+        st.rerun()
+    st.write("버전: 2.7 (구조 안정화)")
+
+# 3. 데이터 로드
+if st.session_state.data.empty:
     st.session_state.data = load_data()
-if "last_status" not in st.session_state:
-    st.session_state.last_status = ""
-# 검색 상태
-if "search_text" not in st.session_state:
-    st.session_state.search_text = ""
-if "search_select" not in st.session_state:
-    st.session_state.search_select = ""
-if "search_active" not in st.session_state:
-    st.session_state.search_active = False  # '검색 적용'을 눌러야 필터 반영
-# 삭제 관련 상태
-if "undo_stack" not in st.session_state:
-    st.session_state.undo_stack = []  # 삭제 전 백업용 (DataFrame copy)
-if "delete_selected_ids" not in st.session_state:
-    st.session_state.delete_selected_ids = []  # ['기록ID', ...]
+
+# 4. 상단 탭 정의
+tab_reg, tab_dash, tab_rpa, tab_del = st.tabs(["등록검색", "대시보드", "희망이음연동", "데이터삭제"])
 
 # -------------------------------
 # (C) 희망이음 RPA 연동 헬퍼
@@ -646,7 +631,7 @@ def scrape_ssis_treatment_status(driver):
 # 탭 1: 등록/검색 구현
 # -------------------------------------------------------------------
 with tab_reg:
-    st.subheader("📌 [최신] 1. 신규 투약 등록 및 대상자 검색")
+    st.subheader("1. 신규 투약 등록 및 대상자 검색")
     with st.form("register_form_main", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
@@ -819,7 +804,7 @@ with tab_dash:
 # 탭 3: 희망이음 연동 (RPA)
 # -------------------------------------------------------------------
 with tab_rpa:
-    st.subheader("🚀 [최신] 희망이음 데이터 자동 가져오기 (반자동)")
+    st.subheader("희망이음 데이터 자동 가져오기 (반자동)")
     
     with st.expander("ℹ️ 실행 전 준비사항 (필독)", expanded=True):
         st.markdown(f"""
