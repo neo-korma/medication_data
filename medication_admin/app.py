@@ -165,17 +165,32 @@ if "data" not in st.session_state:
 def render_admin_tools():
     if PASSWORD_HASH:
         return
+    
     with st.expander("🔧 관리자 도구: 비밀번호 해시 생성기 (초기 설정용)", expanded=True):
-        st.caption(
-            "① 평문 비밀번호를 입력하면 해시를 생성합니다. "
-            "② 생성된 문자열을 `.streamlit/secrets.toml`의 [app].password_hash 에 저장하세요."
-        )
+        st.warning("⚠️ 현재 `password_hash` 설정이 비어 있습니다. (로그인 불가)")
+        
+        # 클라우드 vs 로컬 안내 (로컬 파일 존재 여부로 추측)
+        if not os.path.exists(".streamlit/secrets.toml"):
+            st.info(
+                "💡 **Streamlit Cloud(웹)**에서 보시는 경우:\n\n"
+                "로컬의 `secrets.toml` 파일은 보안상 웹으로 전송되지 않습니다. "
+                "웹 대시보드의 **[Settings] -> [Secrets]** 메뉴에 아래의 해시 설정을 직접 붙여넣어야 합니다."
+            )
+        else:
+            st.info(
+                "💡 **로컬 환경**에서 보시는 경우:\n\n"
+                "프로젝트 폴더 내 `.streamlit/secrets.toml` 파일을 열어 `password_hash` 값을 업데이트하세요."
+            )
+
+        st.markdown("---")
+        st.caption("① 평문 비밀번호를 입력하면 해시를 생성합니다. ② 생성된 문자열을 설정(Secrets)에 저장하세요.")
         col1, col2 = st.columns([2, 1])
         with col1:
-            plain = st.text_input("평문 비밀번호 입력(표시됨)", value="", type="default")
+            plain = st.text_input("평문 비밀번호 입력(표시됨)", value="", type="default", key="admin_plain_pwd")
         with col2:
-            iters = st.number_input("iterations", min_value=100_000, value=260_000, step=10_000)
-        if st.button("해시 생성하기"):
+            iters = st.number_input("iterations", min_value=100_000, value=260_000, step=10_000, key="admin_iters")
+        
+        if st.button("해시 생성하기", key="btn_gen_hash"):
             if plain:
                 def _make_hash(p: str, iterations: int = 260_000) -> str:
                     salt = os.urandom(16)
@@ -184,9 +199,82 @@ def render_admin_tools():
                     return f"pbkdf2_sha256${iterations}${b64.b64encode(salt).decode()}${b64.b64encode(dk).decode()}"
                 hashed = _make_hash(plain, int(iters))
                 st.code(hashed, language="text")
-                st.success("위 문자열을 secrets.toml에 저장한 뒤, 앱을 Rerun 하세요.")
+                st.success("위 문자열을 [app] 섹션의 password_hash 항목에 저장한 뒤 앱을 새로고침하세요.")
             else:
                 st.warning("평문 비밀번호를 입력해 주세요.")
+
+    with st.expander("☁️ Microsoft 365 연동 도우미 (ID 자동 찾기)", expanded=False):
+        st.markdown("""
+        이 도구는 **Client Secret**을 사용하여 SharePoint 사이트와 목록의 ID를 자동으로 찾아줍니다.
+        1. Azure 포털에서 생성한 **Client Secret**을 아래에 입력하세요.
+        2. [연동 테스트 및 ID 찾기] 버튼을 누르세요.
+        """)
+        
+        test_secret = st.text_input("Client Secret 입력", type="password", key="test_secret")
+        test_site_url = st.text_input("SharePoint 사이트 주소", value="https://eunpyongorkr.sharepoint.com/sites/T-Severely", key="test_site_url")
+        
+        if st.button("🚀 연동 테스트 및 ID 찾기", use_container_width=True):
+            if not test_secret:
+                st.warning("Client Secret을 입력해 주세요.")
+            else:
+                with st.spinner("Microsoft Graph API 연결 중..."):
+                    # 토큰 획득 테스트
+                    t_id = st.secrets["msgraph"]["tenant_id"]
+                    c_id = st.secrets["msgraph"]["client_id"]
+                    
+                    token_url = f"https://login.microsoftonline.com/{t_id}/oauth2/v2.0/token"
+                    payload = {
+                        "client_id": c_id,
+                        "scope": "https://graph.microsoft.com/.default",
+                        "client_secret": test_secret,
+                        "grant_type": "client_credentials",
+                    }
+                    try:
+                        r = requests.post(token_url, data=payload, timeout=10)
+                        res = r.json()
+                        if "error" in res:
+                            st.error(f"토큰 획득 실패: {res.get('error_description')}")
+                        else:
+                            st.success("✅ 인증 성공! (토큰 획득 완료)")
+                            token = res["access_token"]
+                            headers = {"Authorization": f"Bearer {token}"}
+                            
+                            # 1. Site ID 찾기
+                            # URL에서 호스트와 경로 추출
+                            from urllib.parse import urlparse
+                            parsed = urlparse(test_site_url)
+                            host = parsed.netloc
+                            path = parsed.path
+                            
+                            site_query = f"https://graph.microsoft.com/v1.0/sites/{host}:{path}"
+                            sr = requests.get(site_query, headers=headers, timeout=10)
+                            sres = sr.json()
+                            
+                            if "id" in sres:
+                                found_site_id = sres["id"]
+                                st.write(f"📍 **찾은 Site ID:**")
+                                st.code(found_site_id)
+                                
+                                # 2. List 찾기
+                                list_query = f"https://graph.microsoft.com/v1.0/sites/{found_site_id}/lists"
+                                lr = requests.get(list_query, headers=headers, timeout=10)
+                                lres = lr.json()
+                                
+                                if "value" in lres:
+                                    st.write("📋 **사이트 내 목록 리스트:**")
+                                    found_lists = lres["value"]
+                                    if not found_lists:
+                                        st.info("사이트에 목록이 없습니다. Microsoft Lists에서 새 목록을 만들어 주세요.")
+                                    for l in found_lists:
+                                        with st.container():
+                                            col_a, col_b = st.columns([1, 2])
+                                            col_a.write(f"**{l['displayName']}**")
+                                            col_b.code(l['id'])
+                            else:
+                                st.error("사이트 ID를 찾을 수 없습니다. 주소를 확인해 주세요.")
+                                st.json(sres)
+                    except Exception as e:
+                        st.error(f"연결 오류 발생: {e}")
 
 
 # --- 로그인 폼 ---
@@ -593,12 +681,15 @@ def get_driver_connected():
         st.info("9222 포트로 실행된 크롬 창이 있는지 확인해 주세요.")
         return None
 
-def scrape_ssis_treatment_status(driver):
-    """희망이음 진료 현황 테이블 데이터 추출"""
+def scrape_ssis_treatment_status(driver, progress_bar=None, status_text=None):
+    """희망이음 진료 현황 테이블 데이터 추출 (진행 바 반영)"""
     try:
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
+
+        if status_text: status_text.info("🔍 화면에서 표 데이터를 찾는 중...")
+        if progress_bar: progress_bar.progress(50)
 
         # 테이블이 나타날 때까지 대기
         wait = WebDriverWait(driver, 10)
@@ -610,19 +701,26 @@ def scrape_ssis_treatment_status(driver):
         target_table = None
         max_rows = 0
         for t in tables:
-            rows = t.find_elements(By.TAG_NAME, "tr")
-            if len(rows) > max_rows:
-                max_rows = len(rows)
-                target_table = t
+            try:
+                rows = t.find_elements(By.TAG_NAME, "tr")
+                if len(rows) > max_rows:
+                    max_rows = len(rows)
+                    target_table = t
+            except:
+                continue
 
         if not target_table:
             return None, "데이터 테이블을 찾을 수 없습니다."
+
+        if status_text: status_text.info("⚙️ 표 데이터를 읽고 분석하는 중...")
+        if progress_bar: progress_bar.progress(80)
 
         html_content = target_table.get_attribute('outerHTML')
         dfs = pd.read_html(html_content)
         if not dfs:
             return None, "테이블 파싱에 실패했습니다."
 
+        if progress_bar: progress_bar.progress(100)
         return dfs[0], "성공"
 
     except Exception as e:
@@ -840,16 +938,25 @@ def main():
         col_r1, col_r2 = st.columns([1, 1])
         with col_r1:
             if st.button("🔍 현재 브라우저에서 데이터 긁어오기", use_container_width=True):
+                # 진행 표시를 위한 컨테이너
+                prog_bar = st.progress(0)
+                stat_msg = st.empty()
+                
+                stat_msg.info("🔗 브라우저 연결 시도 중...")
+                prog_bar.progress(20)
+                
                 driver = get_driver_connected()
                 if driver:
-                    with st.spinner("데이터를 추출 중입니다..."):
-                        df_scraped, msg = scrape_ssis_treatment_status(driver)
-                        if df_scraped is not None:
-                            st.session_state.scraped_df = df_scraped
-                            st.success(f"데이터 추출 성공! ({len(df_scraped)}건)")
-                        else:
-                            st.error(msg)
+                    df_scraped, msg = scrape_ssis_treatment_status(driver, progress_bar=prog_bar, status_text=stat_msg)
+                    if df_scraped is not None:
+                        st.session_state.scraped_df = df_scraped
+                        stat_msg.success(f"✅ 데이터 추출 성공! ({len(df_scraped)}건)")
+                    else:
+                        stat_msg.error(msg)
                     driver.quit()
+                else:
+                    prog_bar.empty()
+                    # get_driver_connected 내부에서 이미 에러 메시지를 표시함
 
         if "scraped_df" in st.session_state:
             st.write("### 📋 추출된 데이터 미리보기")
