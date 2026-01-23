@@ -10,8 +10,8 @@
 ---------------------------------------
 [app]
 password_hash = "pbkdf2_sha256$260000$SALT_BASE64$DERIVED_KEY_BASE64"
-max_attempts = 5
-lock_minutes = 10
+max_attempts = 10
+lock_minutes = 3
 
 [msgraph]
 tenant_id     = "YOUR_TENANT_ID"
@@ -570,6 +570,63 @@ def save_data(df: pd.DataFrame):
 # =========================
 # 메인 실행 흐름 (포괄적 예외 처리)
 # =========================
+
+# -------------------------------------------------------------------
+# (C) 희망이음 RPA 연동 헬퍼
+# -------------------------------------------------------------------
+def get_driver_connected():
+    """이미 실행 중인 디버깅 브라우저(9222)에 연결"""
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+    except ImportError:
+        st.error("Selenium 라이브러리가 설치되지 않았습니다.")
+        return None
+
+    chrome_options = Options()
+    chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
+    except Exception as e:
+        st.error(f"브라우저 연결 실패: {e}")
+        st.info("9222 포트로 실행된 크롬 창이 있는지 확인해 주세요.")
+        return None
+
+def scrape_ssis_treatment_status(driver):
+    """희망이음 진료 현황 테이블 데이터 추출"""
+    try:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
+        # 테이블이 나타날 때까지 대기
+        wait = WebDriverWait(driver, 10)
+        tables = driver.find_elements(By.TAG_NAME, "table")
+
+        if not tables:
+            return None, "화면에서 테이블을 찾을 수 없습니다. '대상자 진료 현황' 페이지가 맞는지 확인해 주세요."
+
+        target_table = None
+        max_rows = 0
+        for t in tables:
+            rows = t.find_elements(By.TAG_NAME, "tr")
+            if len(rows) > max_rows:
+                max_rows = len(rows)
+                target_table = t
+
+        if not target_table:
+            return None, "데이터 테이블을 찾을 수 없습니다."
+
+        html_content = target_table.get_attribute('outerHTML')
+        dfs = pd.read_html(html_content)
+        if not dfs:
+            return None, "테이블 파싱에 실패했습니다."
+
+        return dfs[0], "성공"
+
+    except Exception as e:
+        return None, f"스크래핑 오류: {e}"
 
 def main():
     # 1. 인증 게이트
