@@ -1,0 +1,1036 @@
+
+# -*- coding: utf-8 -*-
+"""
+==========================================
+복지시설 투약 관리 (모바일 대응 탭 UI) — app.py
+(Microsoft Lists + OneDrive 버전)
+==========================================
+
+[설정 가이드 - .streamlit/secrets.toml]
+---------------------------------------
+[app]
+password_hash = "pbkdf2_sha256$260000$SALT_BASE64$DERIVED_KEY_BASE64"
+max_attempts = 5
+lock_minutes = 10
+
+[msgraph]
+tenant_id     = "YOUR_TENANT_ID"
+client_id     = "YOUR_APP_CLIENT_ID"
+client_secret = "YOUR_APP_CLIENT_SECRET"
+site_id       = "YOUR_SHAREPOINT_SITE_ID"
+list_id       = "YOUR_LIST_ID"
+
+[onedrive]
+drive_id    = "YOUR_DRIVE_ID"
+backup_path = "복지시설투약관리/medication_data.csv"
+
+[주의]
+- 이 앱은 "단일 비밀번호"를 공유하는 간편 보안 방식입니다.
+  사용자별 접근제어/감사 기능은 제공하지 않으므로, 비밀번호 유출/공유에 취약할 수 있습니다.
+- 데이터(CSV)는 앱과 동일 폴더에 캐시로 저장됩니다.
+- 영구 저장/복구는 Microsoft Lists 및 OneDrive 파일을 사용합니다.
+"""
+
+import os
+import time
+import base64
+import hashlib
+import hmac
+import uuid
+from datetime import date, timedelta, datetime
+
+import pandas as pd
+import streamlit as st
+import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# -------------------------------
+# 기본 설정
+# -------------------------------
+st.set_page_config(page_title="복지시설 투약 관리", layout="wide")
+st.title("💊 생활인 투약 관리 시스템 (Microsoft 365)")
+
+# (선택) 입력 필드 최대 폭 조정: 모바일에서도 과도한 넓이를 방지
+st.markdown(
+    """
+<style>
+/* password input 최대 폭 */
+section[data-testid="stTextInput"] input[type="password"] {
+  max-width: 480px;
+}
+
+/* 일반 텍스트 입력/숫자 입력의 최대 폭도 적절히 제한 */
+section[data-testid="stTextInput"] input[type="text"],
+section[data-testid="stNumberInput"] input[type="number"],
+section[data-testid="stDateInput"] input[type="text"],
+textarea {
+  max-width: 520px;
+}
+
+/* 탭이 모바일에서 붙지 않도록 여백 */
+div[data-baseweb="tab-list"] {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+DB_FILE = "medication_data.csv"
+
+# -------------------------------
+# (A) 단일 비밀번호 게이트 (공유 비밀번호)
+# -------------------------------
+def verify_password(plain: str, stored: str) -> bool:
+    """
+    PBKDF2 해시 검증
+    형식: pbkdf2_sha256$<iterations>$<salt_b64>$<dk_b64>
+    """
+    try:
+        algo, iters, salt_b64, dk_b64 = stored.split("$")
+        assert algo == "pbkdf2_sha256"
+        iters = int(iters)
+        salt = base64.b64decode(salt_b64)
+        dk_true = base64.b64decode(dk_b64)
+        dk_test = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt, iters)
+        return hmac.compare_digest(dk_true, dk_test)
+    except Exception:
+        return False
+
+
+def make_hash(plain: str, iterations: int = 260_000) -> str:
+    """PBKDF2 해시 생성기 (관리자 도구 용)"""
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", plain.encode("utf-8"), salt, iterations)
+    return (
+        f"pbkdf2_sha256${iterations}$"
+        f"{base64.b64encode(salt).decode()}$"
+        f"{base64.b64encode(dk).decode()}"
+    )
+
+
+# --- secrets 안전 로딩 ---
+def _load_app_cfg():
+    try:
+        _s = st.secrets  # 없으면 여기서 예외 발생
+        return dict(_s.get("app", {}))  # 섹션 없으면 {}
+    except Exception:
+        return {}
+
+
+APP_CFG = _load_app_cfg()
+PASSWORD_HASH = (APP_CFG.get("password_hash") or "").strip()
+MAX_ATTEMPTS = int(APP_CFG.get("max_attempts", 5))
+LOCK_MINUTES = int(APP_CFG.get("lock_minutes", 10))
+
+# --- 상태값 ---
+if "auth_ok" not in st.session_state:
+    st.session_state.auth_ok = False
+if "fail_count" not in st.session_state:
+    st.session_state.fail_count = 0
+if "locked_until" not in st.session_state:
+    st.session_state.locked_until = 0.0
+
+# --- 관리자 도구(해시 생성기): '정말 필요할 때'만 보여주기 ---
+def render_admin_tools():
+    if PASSWORD_HASH:
+        return
+    with st.expander("🔧 관리자 도구: 비밀번호 해시 생성기 (초기 설정용)", expanded=True):
+        st.caption(
+            "① 평문 비밀번호를 입력하면 해시를 생성합니다. "
+            "② 생성된 문자열을 `.streamlit/secrets.toml`의 [app].password_hash 에 저장하세요."
+        )
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            plain = st.text_input("평문 비밀번호 입력(표시됨)", value="", type="default")
+        with col2:
+            iters = st.number_input("iterations", min_value=100_000, value=260_000, step=10_000)
+        if st.button("해시 생성하기"):
+            if plain:
+                def _make_hash(p: str, iterations: int = 260_000) -> str:
+                    salt = os.urandom(16)
+                    dk = hashlib.pbkdf2_hmac("sha256", p.encode("utf-8"), salt, iterations)
+                    import base64 as b64
+                    return f"pbkdf2_sha256${iterations}${b64.b64encode(salt).decode()}${b64.b64encode(dk).decode()}"
+                hashed = _make_hash(plain, int(iters))
+                st.code(hashed, language="text")
+                st.success("위 문자열을 secrets.toml에 저장한 뒤, 앱을 Rerun 하세요.")
+            else:
+                st.warning("평문 비밀번호를 입력해 주세요.")
+
+
+# --- 로그인 폼 ---
+def login_form(now_ts: float, align: str = "center", width_fraction: float = 1/3):
+    st.subheader("🔐 접근 비밀번호를 입력하세요.")
+
+    width_fraction = max(0.2, min(width_fraction, 1.0))
+    if align == "left":
+        left_col, right_sp = st.columns([width_fraction, 1 - width_fraction])
+        target_col = left_col
+    else:
+        side = (1 - width_fraction) / 2
+        _, target_col, _ = st.columns([side, width_fraction, side])
+
+    with target_col:
+        with st.form("login_form", clear_on_submit=False):
+            pwd = st.text_input("비밀번호", type="password", label_visibility="visible")
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                submit = st.form_submit_button("입장하기", use_container_width=True)
+            with c2:
+                st.caption(f"※ 연속 실패 {MAX_ATTEMPTS}회 시 {LOCK_MINUTES}분 잠금")
+
+        if submit:
+            if not PASSWORD_HASH:
+                st.error("서버 비밀번호가 아직 설정되지 않았습니다. 관리자에게 문의하세요.")
+                return
+            ok = verify_password(pwd, PASSWORD_HASH)
+            if ok:
+                st.session_state.auth_ok = True
+                st.session_state.fail_count = 0
+                st.session_state.locked_until = 0.0
+                st.success("접속 성공")
+            else:
+                st.session_state.fail_count += 1
+                if st.session_state.fail_count >= MAX_ATTEMPTS:
+                    st.session_state.locked_until = now_ts + (LOCK_MINUTES * 60)
+                    st.warning(f"연속 {MAX_ATTEMPTS}회 실패로 {LOCK_MINUTES}분 잠금되었습니다.")
+                else:
+                    remain = MAX_ATTEMPTS - st.session_state.fail_count
+                    st.error(f"비밀번호가 올바르지 않습니다. (남은 시도: {remain})")
+
+
+# --- 게이트 ---
+def render_gate_and_stop_if_not_authenticated():
+    now_ts = time.time()
+    # 잠금 상태
+    if st.session_state.locked_until and now_ts < st.session_state.locked_until:
+        left = int((st.session_state.locked_until - now_ts) // 60) + 1
+        st.error(f"보안 잠금 중입니다. {left}분 후 다시 시도하세요.")
+        render_admin_tools()
+        st.stop()
+
+    if not st.session_state.auth_ok:
+        login_form(now_ts, align="center", width_fraction=1/3)
+        render_admin_tools()
+        if not st.session_state.auth_ok:
+            st.stop()
+
+
+# 실제 호출
+render_gate_and_stop_if_not_authenticated()
+
+# -------------------------------
+# 사이드바: 로그아웃/안내
+# -------------------------------
+with st.sidebar:
+    if st.button("로그아웃"):
+        st.session_state.auth_ok = False
+        st.session_state.fail_count = 0
+        st.session_state.locked_until = 0.0
+        st.rerun()
+    st.caption("보안을 위해 비밀번호는 주기적으로 교체하세요.")
+    st.caption("※ 모바일에서는 핵심 기능(등록/검색/삭제)이 상단 탭에 표시됩니다.")
+
+# -------------------------------
+# (B) 투약 관리 본 기능
+# -------------------------------
+def generate_id() -> str:
+    """레코드 고유 ID"""
+    return uuid.uuid4().hex
+
+
+# 복용시간대 옵션 및 정렬 기준
+TIME_OPTIONS = [
+    "아침약", "점심약", "저녁약", "아침 식전약", "저녁 식전약", "취침전약"
+]
+TIME_ORDER_MAP = {
+    "아침 식전약": 0,
+    "아침약": 1,
+    "점심약": 2,
+    "저녁 식전약": 3,
+    "저녁약": 4,
+    "취침전약": 5,
+}
+
+# 필수 컬럼
+REQUIRED_COLS = [
+    "기록ID",
+    "이름", "병원명", "약품명", "처방일", "복용일수",
+    "종료예정일", "비고", "남은약", "복용시간대"
+]
+
+# =========================
+# Microsoft Graph (Lists + OneDrive) 헬퍼
+# =========================
+
+def _ms_cfg():
+    try:
+        cfg = dict(st.secrets.get("msgraph", {}))
+        if not cfg:
+            raise RuntimeError("msgraph 설정이 없습니다. secrets.toml을 확인하세요.")
+        return cfg
+    except Exception:
+        raise RuntimeError("msgraph 설정이 없습니다. secrets.toml을 확인하세요.")
+
+def _onedrive_cfg():
+    try:
+        cfg = dict(st.secrets.get("onedrive", {}))
+        if not cfg:
+            raise RuntimeError("onedrive 설정이 없습니다. secrets.toml을 확인하세요.")
+        return cfg
+    except Exception:
+        raise RuntimeError("onedrive 설정이 없습니다. secrets.toml을 확인하세요.")
+
+def _get_token():
+    # 간단 캐시
+    if "ms_token" in st.session_state and st.session_state.get("ms_token_exp", 0) > time.time() + 60:
+        return st.session_state["ms_token"]
+    cfg = _ms_cfg()
+    tenant = cfg["tenant_id"]
+    client_id = cfg["client_id"]
+    client_secret = cfg["client_secret"]
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "client_credentials",
+        "scope": "https://graph.microsoft.com/.default",
+    }
+    r = requests.post(token_url, data=data, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"토큰 발급 실패: {r.status_code} {r.text}")
+    tok = r.json()
+    st.session_state["ms_token"] = tok["access_token"]
+    st.session_state["ms_token_exp"] = time.time() + tok.get("expires_in", 3599)
+    return tok["access_token"]
+
+def _gheaders(json=True):
+    hdrs = {"Authorization": f"Bearer {_get_token()}"}
+    if json:
+        hdrs["Content-Type"] = "application/json"
+    return hdrs
+
+# ----- Microsoft List 필드 매핑 -----
+# DataFrame(KR) <-> Microsoft List(EN internal)
+FIELD_MAP = {
+    "기록ID": "RecordID",
+    "이름": "Name",
+    "병원명": "Hospital",
+    "약품명": "Drug",
+    "복용시간대": "TimeSlot",
+    "처방일": "StartDate",
+    "복용일수": "Days",
+    "종료예정일": "EndDate",
+    "비고": "Memo",
+    "남은약": "LeftPills",
+}
+REVERSE_FIELD_MAP = {v: k for k, v in FIELD_MAP.items()}
+
+def _list_fetch_all_items():
+    """Microsoft List 아이템 전체 조회 (expand=fields)."""
+    cfg = _ms_cfg()
+    site_id = cfg["site_id"]
+    list_id = cfg["list_id"]
+    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items?expand=fields&$top=2000"
+    items = []
+    while True:
+        r = requests.get(url, headers=_gheaders(), timeout=30)
+        if not r.ok:
+            raise RuntimeError(f"List 불러오기 실패: {r.status_code} {r.text}")
+        data = r.json()
+        items.extend(data.get("value", []))
+        next_link = data.get("@odata.nextLink")
+        if not next_link:
+            break
+        url = next_link
+    return items
+
+def _list_clear_all_items():
+    """모든 아이템 삭제 (소량 데이터 가정)."""
+    cfg = _ms_cfg()
+    site_id = cfg["site_id"]
+    list_id = cfg["list_id"]
+    items = _list_fetch_all_items()
+    for it in items:
+        item_id = it.get("id")
+        if not item_id:
+            continue
+        url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items/{item_id}"
+        r = requests.delete(url, headers=_gheaders(), timeout=30)
+        if not r.ok and r.status_code != 404:
+            raise RuntimeError(f"List 아이템 삭제 실패: {r.status_code} {r.text}")
+
+def _list_add_item(fields: dict):
+    """한 건 추가: fields 사전은 Microsoft List 내부 필드명 기준."""
+    cfg = _ms_cfg()
+    site_id = cfg["site_id"]
+    list_id = cfg["list_id"]
+    url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/lists/{list_id}/items"
+    payload = {"fields": fields}
+    r = requests.post(url, headers=_gheaders(), json=payload, timeout=30)
+    if not r.ok:
+        raise RuntimeError(f"List 아이템 추가 실패: {r.status_code} {r.text}")
+    return r.json()
+
+def _list_replace_all(df: pd.DataFrame):
+    """
+    ⚠️ 간단 구현: 리스트 전체를 '초기화하고' DataFrame 내용을 모두 다시 추가합니다.
+    - 소규모 데이터 기준으로 충분 (권장: 수백 건 이하)
+    - 대규모 데이터면 Upsert(키=RecordID) 로직으로 최적화 필요
+    """
+    # 1) 모두 삭제
+    _list_clear_all_items()
+
+    # 2) 모두 추가
+    if df is None or df.empty:
+        return
+
+    # 날짜는 'YYYY-MM-DD' 문자열로
+    out = df.copy()
+    for col in ["처방일", "종료예정일"]:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.strftime("%Y-%m-%d")
+    out = out.fillna("")
+
+    for _, row in out.iterrows():
+        fields = {}
+        for kr, en in FIELD_MAP.items():
+            val = row.get(kr, "")
+            # 숫자 캐스팅
+            if kr in ["복용일수", "남은약"]:
+                try:
+                    val = int(val) if str(val).strip() != "" else 0
+                except Exception:
+                    val = 0
+            fields[en] = val
+        # Title은 표시용 → 이름으로
+        fields["Title"] = str(row.get("이름", "") or "")
+        _list_add_item(fields)
+
+def _list_to_dataframe(items) -> pd.DataFrame:
+    """List 아이템(JSON) -> 앱 DataFrame(한국어 스키마)."""
+    rows = []
+    for it in items:
+        f = it.get("fields", {})
+        row = {}
+        for kr, en in FIELD_MAP.items():
+            row[kr] = f.get(en, "")
+        rows.append(row)
+    df = pd.DataFrame(rows, columns=REQUIRED_COLS)
+    return df
+
+def _onedrive_upload_bytes(content: bytes, path: str):
+    """OneDrive에 파일 업로드(덮어쓰기)."""
+    od = _onedrive_cfg()
+    drive_id = od["drive_id"]
+    # 경로 내 공백/한글 허용. Graph는 UTF-8 path OK
+    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{path}:/content"
+    r = requests.put(url, headers={"Authorization": f"Bearer {_get_token()}"}, data=content, timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"OneDrive 업로드 실패: {r.status_code} {r.text}")
+
+def _onedrive_download_bytes(path: str) -> bytes:
+    """OneDrive에서 파일 다운로드(바이트). 없으면 예외."""
+    od = _onedrive_cfg()
+    drive_id = od["drive_id"]
+    url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{path}:/content"
+    r = requests.get(url, headers={"Authorization": f"Bearer {_get_token()}"}, timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"OneDrive 다운로드 실패: {r.status_code} {r.text}")
+    return r.content
+
+# =========================
+# 스키마 & 저장/로드
+# =========================
+def ensure_schema(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        df = pd.DataFrame(columns=REQUIRED_COLS)
+
+    # 누락 컬럼 채움
+    for col in REQUIRED_COLS:
+        if col not in df.columns:
+            if col == "기록ID":
+                df[col] = ""
+            elif col in ["복용일수", "남은약"]:
+                df[col] = 0
+            elif col in ["처방일", "종료예정일"]:
+                df[col] = pd.NaT
+            else:
+                df[col] = ""
+
+    # 타입 강제
+    df["처방일"] = pd.to_datetime(df["처방일"], errors="coerce")
+    df["종료예정일"] = pd.to_datetime(df["종료예정일"], errors="coerce")
+    df["복용일수"] = pd.to_numeric(df["복용일수"], errors="coerce").fillna(0).astype(int)
+    df["남은약"] = pd.to_numeric(df["남은약"], errors="coerce").fillna(0).astype(int)
+    for col in ["기록ID", "이름", "병원명", "약품명", "비고", "복용시간대"]:
+        df[col] = df[col].fillna("").astype(str)
+
+    # 기록ID가 비어있는 행에 새 ID 부여
+    mask_no_id = (df["기록ID"].str.len() == 0)
+    if mask_no_id.any():
+        df.loc[mask_no_id, "기록ID"] = [generate_id() for _ in range(mask_no_id.sum())]
+
+    # 필수 날짜 결측 제거(입력 실수 방지)
+    df = df.dropna(subset=["처방일", "종료예정일"])
+
+    # 컬럼 순서 통일
+    df = df[REQUIRED_COLS]
+    return df
+
+
+def load_data() -> pd.DataFrame:
+    """
+    1) 로컬 CSV 우선 로드
+    2) 실패/없음 -> Microsoft List 폴백
+    3) 그래도 실패 -> OneDrive 백업 CSV 폴백
+    """
+    # 1) 로컬 CSV
+    if os.path.exists(DB_FILE):
+        try:
+            df = pd.read_csv(DB_FILE, encoding="utf-8-sig")
+            return ensure_schema(df)
+        except Exception as e:
+            st.warning(f"로컬 CSV 로드 실패: {e}")
+
+    # 2) Microsoft List 폴백
+    try:
+        items = _list_fetch_all_items()
+        if items:
+            df = _list_to_dataframe(items)
+            df = ensure_schema(df)
+            # 로컬 캐시 저장
+            try:
+                df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
+            except Exception as e:
+                st.info(f"로컬 캐시 저장 실패(무시 가능): {e}")
+            return df
+    except Exception as e:
+        st.warning(f"Microsoft List 로드 실패: {e}")
+
+    # 3) OneDrive 백업 CSV 폴백
+    try:
+        od = _onedrive_cfg()
+        backup_path = od.get("backup_path", "복지시설투약관리/medication_data.csv")
+        content = _onedrive_download_bytes(backup_path)
+        from io import BytesIO, StringIO
+        csv_text = content.decode("utf-8-sig")
+        df = pd.read_csv(StringIO(csv_text))
+        df = ensure_schema(df)
+        # 로컬 캐시 저장
+        try:
+            df.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            st.info(f"로컬 캐시 저장 실패(무시 가능): {e}")
+        return df
+    except Exception as e:
+        st.error(f"OneDrive 백업 로드 실패: {e}")
+        return ensure_schema(pd.DataFrame(columns=REQUIRED_COLS))
+
+
+def save_data(df: pd.DataFrame):
+    """
+    로컬 CSV 저장 + Microsoft List 전체 반영 + OneDrive 백업 업로드
+    - 원격 저장 실패 시 경고만 표시하고 계속
+    """
+    # 1) 로컬 캐시
+    try:
+        df_to_save = ensure_schema(df.copy())
+        df_to_save.to_csv(DB_FILE, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        st.warning(f"로컬 CSV 저장 중 경고: {e}")
+        df_to_save = ensure_schema(df.copy())  # 계속 진행
+
+    # 2) Microsoft List 반영 (전체 교체)
+    try:
+        _list_replace_all(df_to_save)
+    except Exception as e:
+        st.error(f"Microsoft List 저장 실패: {e}")
+
+    # 3) OneDrive 백업 업로드
+    try:
+        od = _onedrive_cfg()
+        backup_path = od.get("backup_path", "복지시설투약관리/medication_data.csv")
+        csv_bytes = df_to_save.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        _onedrive_upload_bytes(csv_bytes, backup_path)
+    except Exception as e:
+        st.error(f"OneDrive 백업 업로드 실패: {e}")
+
+# -------------------------------
+# 세션 상태 초기화
+# -------------------------------
+if "data" not in st.session_state:
+    st.session_state.data = load_data()
+if "last_status" not in st.session_state:
+    st.session_state.last_status = ""
+# 검색 상태
+if "search_text" not in st.session_state:
+    st.session_state.search_text = ""
+if "search_select" not in st.session_state:
+    st.session_state.search_select = ""
+if "search_active" not in st.session_state:
+    st.session_state.search_active = False  # '검색 적용'을 눌러야 필터 반영
+# 삭제 관련 상태
+if "undo_stack" not in st.session_state:
+    st.session_state.undo_stack = []  # 삭제 전 백업용 (DataFrame copy)
+if "delete_selected_ids" not in st.session_state:
+    st.session_state.delete_selected_ids = []  # ['기록ID', ...]
+
+# -------------------------------
+# (C) 희망이음 RPA 연동 헬퍼
+# -------------------------------
+def get_driver_connected():
+    """이미 실행 중인 디버깅 브라우저(9222)에 연결"""
+    chrome_options = Options()
+    chrome_options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        return driver
+    except Exception as e:
+        st.error(f"브라우저 연결 실패: {e}")
+        st.info("9222 포트로 실행된 크롬 창이 있는지 확인해 주세요.")
+        return None
+
+def scrape_ssis_treatment_status(driver):
+    """희망이음 진료 현황 테이블 데이터 추출"""
+    try:
+        # 1. '대상자 진료 현황' 메뉴로 이동 시도 (또는 현재 페이지 확인)
+        # ssis.go.kr 구조에 따라 수정 필요. 현재는 화면의 테이블을 찾는 기본 로직
+        
+        # 테이블이 나타날 때까지 대기
+        wait = WebDriverWait(driver, 10)
+        # 희망이음의 실제 테이블 ID나 클래스로 수정 필요 (예: .list_table, #grid, #contentsTable 등)
+        # 여기서는 가장 일반적인 table 태그를 찾음
+        tables = driver.find_elements(By.TAG_NAME, "table")
+        
+        if not tables:
+            return None, "화면에서 테이블을 찾을 수 없습니다. '대상자 진료 현황' 페이지가 맞는지 확인해 주세요."
+            
+        # 가장 데이터가 많아 보이는 테이블 선택 (보통 본문 테이블)
+        target_table = None
+        max_rows = 0
+        for t in tables:
+            rows = t.find_elements(By.TAG_NAME, "tr")
+            if len(rows) > max_rows:
+                max_rows = len(rows)
+                target_table = t
+        
+        if not target_table:
+            return None, "데이터 테이블을 찾을 수 없습니다."
+
+        # Pandas로 읽기
+        html_content = target_table.get_attribute('outerHTML')
+        dfs = pd.read_html(html_content)
+        if not dfs:
+            return None, "테이블 파싱에 실패했습니다."
+            
+        return dfs[0], "성공"
+        
+    except Exception as e:
+        return None, f"스크래핑 오류: {e}"
+
+# -------------------------------
+# 상단 탭 UI (모바일 대응)
+# -------------------------------
+tab_reg, tab_dash, tab_rpa, tab_del = st.tabs(["📝 등록/검색", "📊 대시보드", "🤖 희망이음 연동", "🗑️ 삭제"])
+
+# -------------------------------------------------------------------
+# 탭 1: 등록/검색
+# -------------------------------------------------------------------
+with tab_reg:
+    st.subheader("신규 투약 등록")
+    with st.form("register_form_main", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            input_name = st.text_input("생활인 성명", value="")
+            input_med_name = st.text_input("약품명", value="")
+            input_time_slot = st.selectbox("복용 시간대", options=TIME_OPTIONS, index=0)
+            input_left_amount = st.number_input("남은 약 수량", min_value=0, value=0)
+        with col2:
+            input_hospital = st.text_input("병원/진료과", value="")
+            input_start_date = st.date_input("처방일", value=date.today())
+            input_days = st.number_input("복용 일수", min_value=1, value=30)
+            input_memo = st.text_area("비고/특이사항", value="")
+
+        submitted = st.form_submit_button("등록하기", use_container_width=True)
+
+    if submitted:
+        name = (input_name or "").strip()
+        hospital = (input_hospital or "").strip()
+        med_name = (input_med_name or "").strip()
+        time_slot = (input_time_slot or "").strip()
+
+        if not (name and hospital and med_name and time_slot):
+            st.warning("모든 필수 정보를 입력해 주세요. (성명/병원/약품명/복용 시간대)")
+        else:
+            start_ts = pd.to_datetime(input_start_date)
+            end_ts = start_ts + timedelta(days=int(input_days))
+            new_row = pd.DataFrame([{
+                "기록ID": generate_id(),
+                "이름": name,
+                "병원명": hospital,
+                "약품명": med_name,
+                "복용시간대": time_slot,
+                "처방일": start_ts,
+                "복용일수": int(input_days),
+                "종료예정일": end_ts,
+                "비고": (input_memo or "").strip(),
+                "남은약": int(input_left_amount),
+            }])
+            st.session_state.data = ensure_schema(pd.concat([st.session_state.data, new_row], ignore_index=True))
+            save_data(st.session_state.data)
+            st.session_state.last_status = f"✅ '{name}'님의 투약 정보가 성공적으로 저장되었습니다!"
+            st.success(st.session_state.last_status)
+
+    st.markdown("---")
+    st.subheader("대상자 검색")
+
+    names_list = sorted([n for n in st.session_state.data["이름"].dropna().unique() if n != ""])
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.session_state.search_text = st.text_input(
+            "이름(부분검색 가능)", value=st.session_state.search_text, placeholder="예: 홍길동", key="search_text_main"
+        )
+    with c2:
+        st.session_state.search_select = st.selectbox(
+            "이름(목록에서 선택)",
+            options=[""] + names_list,
+            index=([""] + names_list).index(st.session_state.search_select)
+            if st.session_state.search_select in ([""] + names_list)
+            else 0,
+            key="search_select_main",
+        )
+
+    bc1, bc2, bc3 = st.columns([1, 1, 2])
+    with bc1:
+        if st.button("검색 적용", use_container_width=True, key="btn_apply_search"):
+            st.session_state.search_active = True
+            st.rerun()
+    with bc2:
+        if st.button("검색 해제(전체 보기)", use_container_width=True, key="btn_clear_search"):
+            st.session_state.search_text = ""
+            st.session_state.search_select = ""
+            st.session_state.search_active = False
+            st.session_state.delete_selected_ids = []
+            st.rerun()
+    with bc3:
+        st.caption("※ '검색 적용'을 눌러야 필터가 반영됩니다.")
+
+# -------------------------------
+# 공통: 필터링 로직 (모든 탭에서 동일)
+# -------------------------------
+df_display = ensure_schema(st.session_state.data.copy())
+
+if not df_display.empty:
+    today_ts = pd.to_datetime(date.today())
+    df_display["남은일수"] = (df_display["종료예정일"] - today_ts).dt.days
+
+filtered_df = df_display.copy()
+
+selected_name = (st.session_state.search_select or "").strip()
+typed_query = (st.session_state.search_text or "").strip()
+
+if st.session_state.search_active and (selected_name or typed_query):
+    if selected_name:
+        filtered_df = filtered_df[filtered_df["이름"] == selected_name]
+    elif typed_query:
+        mask = filtered_df["이름"].str.contains(typed_query, case=False, na=False)
+        filtered_df = filtered_df[mask]
+
+# 공통 정렬본
+if not filtered_df.empty:
+    tmp = filtered_df.copy()
+    tmp["시간순서"] = tmp["복용시간대"].map(TIME_ORDER_MAP).fillna(999).astype(int)
+    display_cols_main = ["이름", "병원명", "약품명", "복용시간대", "처방일", "복용일수", "종료예정일", "남은일수", "비고", "남은약"]
+    tmp = tmp.sort_values(["이름", "병원명", "종료예정일", "시간순서", "약품명"], kind="mergesort")
+    filtered_sorted = tmp[["기록ID"] + display_cols_main].copy()
+else:
+    filtered_sorted = pd.DataFrame(columns=["기록ID", "이름", "병원명", "약품명", "복용시간대", "처방일", "복용일수", "종료예정일", "남은일수", "비고", "남은약"])
+
+# -------------------------------------------------------------------
+# 탭 2: 대시보드
+# -------------------------------------------------------------------
+with tab_dash:
+    st.subheader("대상자 투약 현황 대시보드")
+
+    # 개인 요약(단일 대상자일 때)
+    unique_names = filtered_df["이름"].dropna().unique().tolist() if not filtered_df.empty else []
+    if len(unique_names) == 1:
+        person = unique_names[0]
+        st.markdown(f"### 👤 '{person}' 개인 요약")
+        person_df = filtered_df.copy()
+        person_df["처방일(표시)"] = person_df["처방일"].dt.strftime("%Y-%m-%d")
+        person_df["종료예정일(표시)"] = person_df["종료예정일"].dt.strftime("%Y-%m-%d")
+        person_df["시간순서"] = person_df["복용시간대"].map(TIME_ORDER_MAP).fillna(999).astype(int)
+
+        hospitals = person_df["병원명"].dropna().unique().tolist()
+        hospitals = sorted([h for h in hospitals if h != ""])
+
+        if hospitals:
+            for h in hospitals:
+                sub = person_df[person_df["병원명"] == h].copy()
+                sub = sub.sort_values(["종료예정일", "시간순서", "약품명"], kind="mergesort")
+                show_cols = ["병원명", "약품명", "복용시간대", "처방일(표시)", "종료예정일(표시)", "남은일수", "비고", "남은약"]
+                with st.expander(f"🏥 병원: {h} — 약품 {len(sub)}건", expanded=True):
+                    st.dataframe(sub[show_cols].rename(columns={
+                        "처방일(표시)": "처방일",
+                        "종료예정일(표시)": "종료예정일"
+                    }), use_container_width=True)
+        else:
+            st.info("해당 대상자에 대한 병원 기록이 없습니다.")
+
+    # 대시보드 표(전체/필터 결과)
+    total_count = len(df_display) if not df_display.empty else 0
+    filtered_count = len(filtered_df) if not filtered_df.empty else 0
+    st.caption(f"필터링된 결과: **{filtered_count}건** / 전체: {total_count}건")
+
+    if not filtered_df.empty:
+        # 화면 표시용 날짜 포맷(메인 표에서는 기록ID 숨김)
+        df_show = filtered_sorted.copy()
+        df_show["처방일"] = df_show["처방일"].dt.strftime("%Y-%m-%d")
+        df_show["종료예정일"] = df_show["종료예정일"].dt.strftime("%Y-%m-%d")
+        st.dataframe(
+            df_show[["이름", "병원명", "약품명", "복용시간대", "처방일", "복용일수", "종료예정일", "남은일수", "비고", "남은약"]],
+            use_container_width=True
+        )
+
+        # 다운로드(현재 필터 결과 기준) — CSV
+        csv_bytes = filtered_sorted.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        st.download_button(
+            "📥 (현재 보기 기준) 데이터를 CSV로 내보내기",
+            csv_bytes,
+            "투약관리데이터_필터결과.csv",
+            "text/csv",
+            key="download-csv"
+        )
+    else:
+        st.info("표시할 데이터가 없습니다. (검색 조건을 확인해 주세요)")
+
+# -------------------------------------------------------------------
+# 탭 3: 희망이음 연동 (RPA)
+# -------------------------------------------------------------------
+with tab_rpa:
+    st.subheader("🤖 희망이음 데이터 자동 가져오기 (반자동)")
+    
+    with st.expander("ℹ️ 실행 전 준비사항 (필독)", expanded=True):
+        st.markdown(f"""
+        1.  **크롬 종료**: 열려있는 모든 크롬 창을 닫아주세요.
+        2.  **디버깅 모드 실행**: 아래 명령어를 복사하여 [윈도우 키 + R] -> `cmd` 입력 후 실행하세요.
+            ```powershell
+            chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\\sel_temp"
+            ```
+        3.  **로그인**: 새로 열린 크롬 창에서 [희망이음](https://www.ssis.go.kr)에 접속하여 로그인 및 간편인증을 완료하세요.
+        4.  **페이지 이동**: '대상자 진료 현황' 메뉴까지 수동으로 이동하세요.
+        """)
+
+    col_r1, col_r2 = st.columns([1, 1])
+    with col_r1:
+        if st.button("🔍 현재 브라우저에서 데이터 긁어오기", use_container_width=True):
+            driver = get_driver_connected()
+            if driver:
+                with st.spinner("데이터를 추출 중입니다..."):
+                    df_scraped, msg = scrape_ssis_treatment_status(driver)
+                    if df_scraped is not None:
+                        st.session_state.scraped_df = df_scraped
+                        st.success(f"데이터 추출 성공! ({len(df_scraped)}건)")
+                    else:
+                        st.error(msg)
+                driver.quit()
+
+    if "scraped_df" in st.session_state:
+        st.write("### 📋 추출된 데이터 미리보기")
+        st.dataframe(st.session_state.scraped_df, use_container_width=True)
+        
+        st.info("💡 위 데이터 중 '성명', '병원명', '약품명' 등이 올바른지 확인하세요.")
+        
+        with st.form("import_form"):
+            st.markdown("#### 데이터 매핑 설정")
+            col_m1, col_m2 = st.columns(2)
+            # 희망이음 테이블 컬럼명에 맞춰 기본값 설정 (현장 상황에 따라 수정 필요)
+            all_cols = st.session_state.scraped_df.columns.tolist()
+            
+            with col_m1:
+                col_name = st.selectbox("성명 컬럼", options=all_cols, index=all_cols.index("이름") if "이름" in all_cols else 0)
+                col_hospital = st.selectbox("병원명 컬럼", options=all_cols, index=all_cols.index("기관명") if "기관명" in all_cols else 0)
+            with col_m2:
+                col_drug = st.selectbox("약품명 컬럼", options=all_cols, index=all_cols.index("약품명") if "약품명" in all_cols else 0)
+                col_date = st.selectbox("진료일/처방일 컬럼", options=all_cols, index=0)
+            
+            import_submit = st.form_submit_button("🚀 현재 시스템으로 가져오기 (등록)", use_container_width=True)
+            
+            if import_submit:
+                new_rows = []
+                for _, row in st.session_state.scraped_df.iterrows():
+                    # 데이터 전처리 및 매핑
+                    name = str(row[col_name])
+                    hospital = str(row[col_hospital])
+                    drug = str(row[col_drug])
+                    # 날짜 처리 (문자열 -> datetime)
+                    try:
+                        p_date = pd.to_datetime(row[col_date])
+                    except:
+                        p_date = datetime.today()
+                    
+                    # 기본 "아침약", 30일 복용으로 가등록 (추후 수정 가능)
+                    new_rows.append({
+                        "기록ID": generate_id(),
+                        "이름": name,
+                        "병원명": hospital,
+                        "약품명": drug,
+                        "복용시간대": "아침약",
+                        "처방일": p_date,
+                        "복용일수": 30,
+                        "종료예정일": p_date + timedelta(days=30),
+                        "비고": "희망이음 연동 수집",
+                        "남은약": 0
+                    })
+                
+                if new_rows:
+                    new_df = pd.DataFrame(new_rows)
+                    st.session_state.data = ensure_schema(pd.concat([st.session_state.data, new_df], ignore_index=True))
+                    save_data(st.session_state.data)
+                    st.success(f"총 {len(new_rows)}건의 데이터가 성공적으로 등록되었습니다!")
+                    del st.session_state.scraped_df
+                    st.rerun()
+
+# -------------------------------------------------------------------
+# 탭 4: 삭제 (현재 필터 결과 기준) — 전체 선택/해제 + 선택 유지
+# -------------------------------------------------------------------
+with tab_del:
+    st.subheader("🗑️ 삭제 도구")
+
+    if filtered_sorted.empty:
+        st.info("삭제할 대상이 없습니다. (검색 조건을 확인해 주세요)")
+    else:
+        # 삭제 에디터용 데이터프레임: 현재 필터 결과만
+        delete_df = filtered_sorted.copy()  # ['기록ID' + 표시 컬럼]
+        delete_df = delete_df.rename(columns={
+            "처방일": "처방일(표시용)",
+            "종료예정일": "종료예정일(표시용)"
+        })
+        delete_df["처방일(표시용)"] = pd.to_datetime(delete_df["처방일(표시용)"], errors="coerce").dt.date
+        delete_df["종료예정일(표시용)"] = pd.to_datetime(delete_df["종료예정일(표시용)"], errors="coerce").dt.date
+
+        # ✅ 세션에 저장된 선택 상태로 '삭제' 체크 채워넣기
+        sel_set = set(st.session_state.delete_selected_ids)
+        delete_df.insert(1, "삭제", delete_df["기록ID"].isin(sel_set))
+
+        # 상단 컨트롤: 전체 선택/해제 버튼 (세션에 직접 반영)
+        bc1, bc2, bc3 = st.columns([1, 1, 3])
+        with bc1:
+            if st.button("✅ 전체 선택", use_container_width=True, key="btn_select_all"):
+                st.session_state.delete_selected_ids = delete_df["기록ID"].tolist()
+                st.rerun()
+        with bc2:
+            if st.button("↩️ 전체 해제", use_container_width=True, key="btn_clear_all"):
+                st.session_state.delete_selected_ids = []
+                st.rerun()
+        with bc3:
+            st.caption("※ '전체 선택' 후 일부만 해제도 가능합니다. 선택은 화면 갱신 후에도 유지됩니다.")
+
+        st.caption("아래 표에서 삭제할 행의 체크박스를 선택/해제한 뒤, '선택 행 삭제' 버튼을 누르세요.")
+        edited = st.data_editor(
+            delete_df,
+            column_config={
+                "삭제": st.column_config.CheckboxColumn(
+                    "삭제", help="삭제할 행에 체크", default=False
+                ),
+                "기록ID": st.column_config.TextColumn("기록ID", help="내부 식별자(읽기전용)"),
+                "처방일(표시용)": st.column_config.DateColumn("처방일", format="YYYY-MM-DD", disabled=True),
+                "종료예정일(표시용)": st.column_config.DateColumn("종료예정일", format="YYYY-MM-DD", disabled=True),
+            },
+            disabled=[
+                "기록ID", "이름", "병원명", "약품명", "복용시간대",
+                "처방일(표시용)", "종료예정일(표시용)", "복용일수", "남은일수", "비고", "남은약"
+            ],
+            use_container_width=True,
+            key="delete_editor",
+            hide_index=True
+        )
+
+        # ✅ 사용자가 체크/해제한 최신 상태를 세션에 반영
+        try:
+            selected_now = edited.loc[edited["삭제"] == True, "기록ID"].tolist()
+        except Exception:
+            selected_now = []
+        st.session_state.delete_selected_ids = selected_now
+
+        # 선택 카운트 표시
+        st.caption(f"현재 선택: {len(selected_now)}건 / 표시 중: {len(edited)}건")
+
+        # 삭제 실행 UI
+        col_d1, col_d2 = st.columns([1.2, 1])
+        with col_d1:
+            confirm = st.checkbox("정말 삭제하시겠습니까?", value=False, key="chk_confirm_delete")
+        with col_d2:
+            run_delete = st.button("🚨 선택 행 삭제", type="primary", use_container_width=True, key="btn_run_delete")
+
+        # 복원(Undo)
+        col_u1, col_u2 = st.columns([1, 1])
+        with col_u1:
+            can_undo = len(st.session_state.undo_stack) > 0
+            if st.button("↩️ 마지막 삭제 복원", disabled=not can_undo, use_container_width=True, key="btn_undo"):
+                # 가장 최근 백업 복원
+                st.session_state.data = ensure_schema(st.session_state.undo_stack.pop())
+                save_data(st.session_state.data)
+                st.success("마지막 삭제 작업을 복원했습니다.")
+                st.rerun()
+        with col_u2:
+            st.caption("※ 복원은 같은 실행 세션 내에서만 가능")
+
+        # 실제 삭제 처리
+        if run_delete:
+            selected_ids = list(st.session_state.delete_selected_ids)
+            if not selected_ids:
+                st.warning("삭제할 행을 선택해 주세요.")
+            elif not confirm:
+                st.warning("체크박스로 삭제 의사를 확인해 주세요.")
+            else:
+                # 백업 스택에 현재 데이터 저장(복원용)
+                st.session_state.undo_stack.append(st.session_state.data.copy())
+
+                before = len(st.session_state.data)
+                st.session_state.data = st.session_state.data[~st.session_state.data["기록ID"].isin(selected_ids)].copy()
+                after = len(st.session_state.data)
+                removed = before - after
+
+                save_data(st.session_state.data)
+                # 삭제 후 선택 목록 초기화
+                st.session_state.delete_selected_ids = []
+                st.success(f"선택한 {removed}건을 삭제했습니다.")
+                st.rerun()
+
+    # (옵션) 단일 대상자일 때 "이 사람 기록 전체 삭제"
+    unique_names = filtered_df["이름"].dropna().unique().tolist() if not filtered_df.empty else []
+    if len(unique_names) == 1 and not filtered_df.empty:
+        with st.expander(f"🧹 '{unique_names[0]}' 대상자 기록 일괄 삭제 (주의)", expanded=False):
+            st.warning("이 기능은 현재 필터 결과에서 해당 대상자의 모든 기록을 삭제합니다. 신중히 사용하세요.")
+            all_confirm = st.checkbox("정말 이 대상자의 모든 기록을 삭제합니다.", value=False, key="chk_all_delete")
+            all_delete = st.button("🚨 이 대상자 기록 전체 삭제", key="btn_all_delete")
+            if all_delete:
+                if not all_confirm:
+                    st.warning("체크박스로 삭제 의사를 확인해 주세요.")
+                else:
+                    # 백업
+                    st.session_state.undo_stack.append(st.session_state.data.copy())
+                    target = unique_names[0]
+                    before = len(st.session_state.data)
+                    st.session_state.data = st.session_state.data[st.session_state.data["이름"] != target].copy()
+                    after = len(st.session_state.data)
+                    removed = before - after
+                    save_data(st.session_state.data)
+                    # 선택 목록 초기화
+                    st.session_state.delete_selected_ids = []
+                    st.success(f"'{target}' 대상자의 기록 {removed}건을 삭제했습니다.")
+                    st.rerun()
+
+# 마지막 상태 메시지 토스트
+if st.session_state.last_status:
+    st.toast(st.session_state.last_status)
