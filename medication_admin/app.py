@@ -42,11 +42,8 @@ from datetime import date, timedelta, datetime
 import pandas as pd
 import streamlit as st
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import requests
+# selenium 관련 임포트는 하단 RPA 함수 내부로 이동 (클라우드 환경 임포트 에러 방지)
 
 # -------------------------------
 # 기본 설정
