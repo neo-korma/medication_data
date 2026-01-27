@@ -690,7 +690,7 @@ def save_local_data(df: pd.DataFrame, file_path: str):
 data_source = st.radio("데이터 소스 선택", ("Microsoft Lists/OneDrive", "로컬 파일"))
 
 if data_source == "로컬 파일":
-    local_file_path = st.text_input("로컬 파일 경로를 입력하세요", EXCEL_FILE_PATH)
+    local_file_path = st.text_input("로컬 파일 경로를 입력하세요", EXCEL_FILE_PATH, key="local_file_path")
     if st.button("로컬 데이터 로드"):
         data = load_local_data(local_file_path)
 else:
@@ -1522,7 +1522,7 @@ def save_to_network_file(df: pd.DataFrame, file_path: str):
 # -------------------------------
 
 if data_source == "로컬 파일":
-    local_file_path = st.text_input("로컬 파일 경로를 입력하세요", EXCEL_FILE_PATH)
+    local_file_path = st.text_input("로컬 파일 경로를 입력하세요", EXCEL_FILE_PATH, key="local_file_path")
     if st.button("로컬 데이터 로드"):
         data = load_local_data(local_file_path)
     if st.button("로컬 데이터 저장"):
@@ -1532,10 +1532,10 @@ elif data_source == "Microsoft Lists/OneDrive":
     data = pd.read_csv(DB_FILE)  # 기존 로직 유지
 
 else:  # 네트워크 폴더
-    network_path = st.text_input("네트워크 폴더 경로를 입력하세요", r"\\ep_nas1\만성요양과")
-    username = st.text_input("사용자 이름을 입력하세요")
-    password = st.text_input("비밀번호를 입력하세요", type="password")
-    network_file_path = st.text_input("네트워크 파일 경로를 입력하세요", EXCEL_FILE_PATH)
+    network_path = st.text_input("네트워크 폴더 경로를 입력하세요", r"\\ep_nas1\만성요양과", key="network_path")
+    username = st.text_input("사용자 이름을 입력하세요", key="username")
+    password = st.text_input("비밀번호를 입력하세요", type="password", key="password")
+    network_file_path = st.text_input("네트워크 파일 경로를 입력하세요", EXCEL_FILE_PATH, key="network_file_path")
 
     if st.button("네트워크 폴더 연결"):
         connect_to_network_folder(network_path, username, password)
